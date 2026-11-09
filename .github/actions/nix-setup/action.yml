@@ -1,0 +1,67 @@
+name: Nix setup (hyprtail)
+description: >
+  Installs Nix, restores a GitHub Actions cache of the local Nix store
+  (saving is left to the calling job), and registers Hyprland's public Cachix cache (hyprland.cachix.org)
+  as a substituter so Hyprland/aquamarine/hyprutils/hyprlang/hyprcursor/
+  hyprgraphics are pulled prebuilt instead of rebuilt from source. Read-only:
+  no token is configured or required, so this step behaves identically on
+  pull_request runs from forks. Modeled on hyprwm/actions/nix-setup (the
+  composite action Hyprland's own nix-ci.yml and hyprland-plugins' nix-ci.yml
+  use), minus the authenticated push side we don't need.
+
+inputs:
+  cache-key-suffix:
+    description: >
+      Extra text mixed into the GitHub Actions cache key, e.g. the matrix
+      row name, so different Hyprland refs don't evict each other's store
+      cache entries.
+    required: false
+    default: ""
+  cache-key-rev:
+    description: >
+      The Hyprland commit a row builds when it is not fixed by flake.lock
+      (upstream.yml's moving refs), so a new commit gets a new cache entry.
+    required: false
+    default: ""
+
+outputs:
+  cache-key:
+    description: Primary key of the Nix store cache, for the save step.
+    value: ${{ steps.restore.outputs.primary-key }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install Nix
+      uses: cachix/install-nix-action@v31
+      with:
+        extra_nix_config: |
+          keep-env-derivations = true
+          keep-outputs = true
+
+    # Restore this job's own Nix store (hyprtail's build inputs and anything
+    # not already covered by the hyprland Cachix pull below). A GitHub cache
+    # entry is never overwritten, so the primary key carries what the store
+    # depends on (the flake inputs, plus the row's Hyprland commit): when
+    # that changes, the save creates a new entry instead of being skipped,
+    # and the restore falls back to this row's, then this job's, newest
+    # entry. Old entries go by GitHub's LRU eviction. Restore only:
+    # the combined action saves in a post step that only runs when the job
+    # succeeded (`post-if: success()`), so each job saves explicitly with
+    # nix-community/cache-nix-action/save@v7 and the `cache-key` output, with
+    # the condition it needs.
+    - name: Restore Nix store
+      id: restore
+      uses: nix-community/cache-nix-action/restore@v7
+      with:
+        primary-key: nix-${{ runner.os }}-${{ github.job }}-${{ inputs.cache-key-suffix }}-${{ inputs.cache-key-rev }}-${{ hashFiles('flake.nix', 'flake.lock', 'nix/**') }}
+        restore-prefixes-first-match: |
+          nix-${{ runner.os }}-${{ github.job }}-${{ inputs.cache-key-suffix }}-
+          nix-${{ runner.os }}-${{ github.job }}-
+
+    # Registers hyprland.cachix.org as a substituter (read-only: no
+    # authToken input, so nothing is pushed and no secret is needed).
+    - name: Use hyprland Cachix cache
+      uses: cachix/cachix-action@v17
+      with:
+        name: hyprland

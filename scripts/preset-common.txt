@@ -1,0 +1,4 @@
+# A built-in preset: trail = "builtin:<name>". To change it, copy it to
+# ~/.config/hypr/hyprtail/presets/<name>.conf, edit the copy and set
+# trail = "presets/<name>.conf" 
+# Colors are 0xAARRGGBB or rgba(RRGGBBAA). 

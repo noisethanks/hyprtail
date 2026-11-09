@@ -1,0 +1,23 @@
+# Build outputs
+out/
+build/
+*.o
+*.so
+
+# Fetched Hyprland checkouts
+external/
+
+# Local development scaffolding
+reference/
+dev_env/
+run_dev.sh
+hyprland_rebuild.sh
+CLAUDE.md
+.claude/
+
+# Editor scratch files
+*~
+*.swp
+*.swo
+.vscode/
+.idea/

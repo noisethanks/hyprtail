@@ -1,0 +1,1671 @@
+#include <algorithm>
+#include <bit>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <format>
+#include <limits>
+#include <optional>
+#include <random>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
+#include <unistd.h>
+#include <unordered_map>
+
+#include <plugins/PluginAPI.hpp>
+#include <plugins/HookSystem.hpp>
+#include <plugins/PluginSystem.hpp>
+#include <config/lua/ConfigManager.hpp>
+#include <config/ConfigValue.hpp>
+#include <render/OpenGL.hpp>
+#include <render/Renderer.hpp>
+#include <pointer/PointerManager.hpp>
+#include <pointer/PointerController.hpp>
+#include <managers/input/InputManager.hpp>
+#include <managers/fullscreen/FullscreenController.hpp>
+#include <managers/SessionLockManager.hpp>
+#include <event/EventBus.hpp>
+#include <desktop/state/ViewState.hpp>
+#include <state/MonitorState.hpp>
+#include <output/Monitor.hpp>
+#include <helpers/memory/Memory.hpp>
+#include <helpers/time/Time.hpp>
+#include <helpers/Color.hpp>
+#include <debug/log/Logger.hpp>
+
+#include "compat.hpp"
+#include "Config.hpp"
+#include "ConfigParse.hpp"
+#include "rev.hpp"
+
+#ifndef HYPRTAIL_VERSION
+#error "HYPRTAIL_VERSION is defined by the Makefile (-DHYPRTAIL_VERSION, from the VERSION file)"
+#endif
+#include "CrashGuard.hpp"
+#include "Diagnostics.hpp"
+#include "FileWatch.hpp"
+#include "Layer.hpp"
+#include "LayerPassElement.hpp"
+#include "PointerGate.hpp"
+#include "Trail.hpp"
+#include "RenderUtil.hpp"
+#include "Status.hpp"
+#include "StatePath.hpp"
+#include "WarpPath.hpp"
+
+#include <wayland-server-core.h>
+#include <Compositor.hpp>
+
+using hyprtail::diag::eSeverity;
+using hyprtail::shader::eTopology;
+using hyprtail::cfg::eWarpMode;
+
+static HANDLE s_handle = nullptr;
+
+using hyprtail::compat::RenderCtx;
+
+// The type of the warp detour and of the original it calls, derived from the
+// signature compat.hpp checks the hook target against; the detour asserts it
+// has this type. The other two detours are compat's (hooks::cursorDetour,
+// hooks::mirrorDetour), which call the handlers below.
+using origControllerWarpTo = hyprtail::compat::hooks::DetourT<hyprtail::compat::hooks::ControllerWarpTo>;
+
+// Which render each monitor is in, and which render the cursor hook already
+// ran the lifecycle for. Keyed to a per-monitor serial bumped at RENDER_BEGIN
+// rather than a boolean, so a missed clear can never make a later render skip
+// its lifecycle: the fallback runs unless the hook ran for *this* render.
+namespace {
+    struct SMonitorFrame {
+        uint64_t renderSerial  = 0;
+        uint64_t handledSerial = UINT64_MAX; // never equal before the first hook run
+
+        // Counters for `hyprctl hyprtail`. postChecks: renders whose
+        // RENDER_POST screenshare self-check ran.
+        uint64_t hookRuns = 0, fallbackRuns = 0, draws = 0, emptySkips = 0, postChecks = 0;
+
+        // Screenshare exclude: runLifecycle() sets awaitingCaptureDraw
+        // and stashes this render's draws here instead of adding a CLayerPassElement,
+        // when this monitor needsACopyFB(). onMirrorSaved() consumes them
+        // (drawing directly, after the original, so the copy is clean); the
+        // RENDER_POST self-check in onRenderStageInternal catches it if the hook
+        // never fires and sets captureHookUnavailable, sticky, so the fallback
+        // (draw nothing while this monitor needs a copy) applies from then on.
+        bool                    awaitingCaptureDraw    = false;
+        bool                    captureHookUnavailable = false;
+        std::vector<SLayerDraw> pendingCaptureDraws;
+        double                  pendingCaptureNowMs = 0.0;
+    };
+}
+
+static uint64_t         s_frames = 0;
+static Time::steady_tp  s_epoch;
+static UP<STrail>       s_trail;
+static wl_event_source* s_idleTimer = nullptr;
+// Crash-loop guard: armed only after we've written our own marker
+// (pluginInit()), so its existence alone tells teardown() the marker is ours
+// to remove -- never someone else's (e.g. a nested instance sharing the same
+// state directory) that we merely read and decided not to refuse over.
+static wl_event_source* s_crashGuardTimer = nullptr;
+static CFunctionHook*   s_cursorHook      = nullptr;
+static CFunctionHook*   s_warpHook        = nullptr;
+static CFunctionHook*   s_captureHook     = nullptr;
+// hyprtail:no_trail dynamic window-rule effect. WINDOW_RULE_EFFECT_NONE
+// (0) doubles as "not registered": registerEffect() never returns 0 for a new
+// dynamic name, so this is a safe sentinel for teardown() to guard on.
+static Desktop::Rule::CWindowRuleEffectContainer::storageType s_noTrailEffectIdx = Desktop::Rule::WINDOW_RULE_EFFECT_NONE;
+static hyprtail::CPointerGate                                 s_gate; // pointer over a hyprtail:no_trail window
+static CHyprSignalListener                                    s_preRenderListener;
+static CHyprSignalListener                                    s_renderStageListener;
+static CHyprSignalListener                                    s_mouseMoveListener;
+static CHyprSignalListener                                    s_workspaceActiveListener;
+static CHyprSignalListener                                    s_specialActiveListener;
+static CHyprSignalListener                                    s_workspaceMovedListener;
+static CHyprSignalListener                                    s_configReloadListener;
+static CHyprSignalListener                                    s_monitorRemovedListener;
+static CHyprSignalListener                                    s_monitorDestroyListener;
+static CHyprSignalListener                                    s_layoutChangedListener;
+static CHyprSignalListener                                    s_cursorShapeListener;
+static hyprtail::compat::StatusCommand                        s_statusCommand;
+static hyprtail::cfg::SValues                                 s_config;
+static hyprtail::CFileWatch                                   s_fileWatch;
+static std::unordered_map<Monitor::CMonitor*, SMonitorFrame>  s_monFrame;
+// Each enabled monitor's logical box at the last layout check, to tell a real
+// layout change from an arrange() that changed nothing (onLayoutChanged).
+static std::unordered_map<Monitor::CMonitor*, CBox> s_layout;
+
+static double                                       msSinceEpoch(const Time::steady_tp& tp) {
+    return std::chrono::duration<double, std::milli>(tp - s_epoch).count();
+}
+
+static bool sessionLocked() {
+    return g_pSessionLockManager && g_pSessionLockManager->isSessionLocked();
+}
+
+static bool cursorHidden() {
+    return g_pHyprRenderer && !g_pHyprRenderer->shouldRenderCursor();
+}
+
+// A pointer constraint (lock or confine) means the client owns the pointer:
+// games, mostly. No trail while one is active. Protocol constraints only, on
+// both checkouts: the pin checks the focused surface's active constraint
+// (InputManager.cpp:1825-1845), main the constraint controller's native one
+// (nativeActive, main InputManager.cpp:1887-1891). A confine_pointer window
+// rule doesn't count on either (pin InputManager.cpp:330-341). One difference:
+// main reports no constraint while the controller is suspended, around
+// focus and workspace dispatchers (main PointerConstraintController.cpp:
+// 102-110, :131), so a warp from inside one of those is handled as a
+// warp there instead of ignored.
+static bool pointerConstrained() {
+    return g_pInputManager && g_pInputManager->isConstrained();
+}
+
+// The window under the pointer: the hit test core's pointer-focus path uses
+// (InputManager.cpp:487-488 at the pin), at the pointer's own position and
+// with the same flags minus FOLLOW_MOUSE_CHECK. That flag shrinks the hitbox
+// of every window but the focused one by input:follow_mouse_shrink
+// (ViewHitTester.cpp:42-43, :61-62), a focus-switch hysteresis: it would make
+// the answer depend on focus. The other pointer-location callers leave it out
+// too (InputManager.cpp:876, :946, :1008). Floating windows and z-order are
+// the hit test's (ViewHitTester.cpp:52-131). nullptr: no window there.
+static PHLWINDOW windowUnderPointer() {
+    // NOLINTNEXTLINE(bugprone-signed-bitwise): Hyprland's hit-test flags are a plain int enum.
+    return Desktop::viewState()->hitTest().windowAt(Pointer::mgr()->position(), Desktop::View::RESERVED_EXTENTS | Desktop::View::INPUT_EXTENTS | Desktop::View::ALLOW_FLOATING);
+}
+
+// Whether w has the hyprtail:no_trail rule set. Desktop::Rule::windowEffects()
+// and CWindowRuleApplicator::m_otherProps.props are the documented plugin-read
+// path (WindowRuleApplicator.hpp:63-72 at the pin), the same one
+// hyprbars uses for its own dynamic effects (hyprbars barDeco.cpp:641-646).
+static bool windowExcluded(const PHLWINDOW& w) {
+    if (s_noTrailEffectIdx == Desktop::Rule::WINDOW_RULE_EFFECT_NONE || !w || !w->m_ruleApplicator)
+        return false;
+    const auto& props = w->m_ruleApplicator->m_otherProps.props;
+    const auto  it    = props.find(s_noTrailEffectIdx);
+    if (it == props.end() || !it->second)
+        return false;
+    return hyprtail::params::ruleTruthy(it->second->effect);
+}
+
+// Whether the pointer is over an excluded window, as of the last pre-render
+// evaluation (onPreRender).
+static bool pointerExcluded() {
+    return s_gate.excluded();
+}
+
+// Session lock, pointer constraint, and the pointer being over an excluded
+// window all suppress the source the same way: no new points, idle-
+// marker effects end, motion tracking pauses. Session lock and the excluded
+// window also hard-gate drawing (runLifecycle's `hardGated`); a pointer
+// constraint doesn't: its path points just stop growing and fade out on
+// their own.
+static bool suppressed() {
+    return sessionLocked() || pointerConstrained() || pointerExcluded();
+}
+
+// Screenshare exclude: anything but the literal "include"
+// (a bad config value already normalized to "exclude" by cfg::read()) means
+// keep the trail out of monitor/region captures and mirrors.
+static bool excludeCaptures() {
+    return s_config.screenshare != "include";
+}
+
+// ---------------------------------------------------------------- layers
+
+// Whether a layer may draw at all right now (visibility aside): it has a
+// resolved program, is enabled, and either draws with the cursor hidden or
+// the cursor is shown. Path layers default to drawing while hidden (the
+// trail is decoupled from cursor visibility); quad layers don't (an
+// idle marker defeats a cursor hide).
+static bool layerDrawable(const hyprtail::CLayer& l, bool hidden) {
+    return !l.disabled && l.enabledSetting() && l.resolved() && (l.res.drawWhenHidden || !hidden);
+}
+
+// Layers drawn from the trail's nodes, path and instanced alike: visible
+// while node age < fade_ms, damaged by the extent of the visible nodes.
+static bool nodeLayer(const hyprtail::CLayer& l) {
+    return l.topology() != eTopology::QUAD;
+}
+
+// Quad layers: shown while the pointer has been still for [start, start +
+// duration) (duration 0 = until it moves).
+static bool quadInWindow(const hyprtail::CLayer& l, double nowMs) {
+    const double still = nowMs - s_trail->lastMotionMs;
+    if (still < l.res.startMs)
+        return false;
+    return l.res.durationMs <= 0.0 || still - l.res.startMs < l.res.durationMs;
+}
+
+static CBox quadBoxLocal(const Vector2D& anchor, float extentPx, const Vector2D& monitorPos) {
+    const double e = extentPx + 1.0; // +1px antialiasing margin
+    return CBox{anchor.x - e - monitorPos.x, anchor.y - e - monitorPos.y, 2.0 * e, 2.0 * e};
+}
+
+// (Re)start the wait for quad layers: the timer fires when the earliest one
+// is due and makes a render happen there.
+static void armIdleTimer() {
+    if (!s_idleTimer || !s_trail)
+        return;
+    double start = std::numeric_limits<double>::infinity();
+    for (const auto& l : s_trail->layers) {
+        if (!l->disabled && l->enabledSetting() && l->resolved() && l->topology() == eTopology::QUAD)
+            start = std::min(start, l->res.startMs);
+    }
+    if (!std::isfinite(start))
+        return;
+    // Stillness counts from lastMotionMs, which a playing warp puts at its
+    // end, in the future.
+    const double ahead = std::max(0.0, s_trail->lastMotionMs - msSinceEpoch(Time::steadyNow()));
+    wl_event_source_timer_update(s_idleTimer, std::max(1, sc<int>(std::ceil(start + ahead))));
+}
+
+// Pointer motion from any source: pointer events, warps, or a position change
+// noticed during a render. Restarts the stillness wait.
+static void noteMotion(const Vector2D& pos, double nowMs) {
+    if (!s_trail || pos == s_trail->lastPos)
+        return;
+    s_trail->lastPos      = pos;
+    s_trail->lastMotionMs = nowMs;
+    armIdleTimer();
+}
+
+// Applies whatever applyConfig() queued: a trail switch, layerN's
+// unused-index check, and the `params` string. Defined in the config
+// section below, alongside applyConfig() and reloadShaders(), which it
+// reuses to queue newly-constructed layers' shaders for this same render.
+static void applyPendingState();
+
+// GL is current: apply any queued trail switch (a new set of layers), then
+// compile pending programs (config reload, file change) or fall back to the
+// built-in ones, then resolve parameter values. A layer whose built-in
+// program fails is disabled.
+static void prepareLayers() {
+    applyPendingState();
+
+    bool newlyResolved = false;
+    for (auto& l : s_trail->layers) {
+        if (l->disabled || !l->enabledSetting())
+            continue;
+        if (const auto error = l->slot.prepare()) {
+            l->disabled = true;
+            hyprtail::diag::report(eSeverity::ERR, "shader:" + l->name(), std::format("layer {} disabled: {}", l->name(), *error));
+            l->slot.release();
+            continue;
+        }
+        const auto before = l->res.generation;
+        l->resolve();
+        newlyResolved = newlyResolved || l->res.generation != before;
+    }
+    if (newlyResolved)
+        armIdleTimer();
+}
+
+// Emit point for the next inserted node (cfg::emitPoint). Only
+// the inputs come from here. hasCursor() is private (PointerManager.hpp),
+// so the "no cursor image" check is inlined from the public
+// currentCursorImage() accessor instead of calling it.
+static SVec2f emitPoint(const STrail& p) {
+    const Vector2D                      ptr = Pointer::mgr()->position();
+    std::optional<hyprtail::cfg::SRect> cursorBox;
+    std::optional<hyprtail::cfg::SPair> fromNorm;
+    if (p.emitFromNorm) {
+        fromNorm        = hyprtail::cfg::SPair{.x = p.emitFromNorm->x, .y = p.emitFromNorm->y};
+        const auto& img = Pointer::mgr()->currentCursorImage();
+        if (img.pBuffer || img.surface) {
+            const CBox box = Pointer::mgr()->getCursorBoxGlobal();
+            cursorBox      = hyprtail::cfg::SRect{.x = box.x, .y = box.y, .w = box.w, .h = box.h};
+        }
+    }
+    const auto e = hyprtail::cfg::emitPoint({.x = ptr.x, .y = ptr.y}, cursorBox, fromNorm, {.x = p.emitOffsetPx.x, .y = p.emitOffsetPx.y});
+    return SVec2f{.x = sc<float>(e.x), .y = sc<float>(e.y)};
+}
+
+// How long the source keeps nodes: as long as the longest-fading node layer
+// (path or instanced) that can draw draws them, plus RETAIN_MARGIN_MS.
+// Quad layers draw no nodes. The margin keeps a live fade_ms raise from
+// finding its oldest nodes already gone for a frame or two.
+static constexpr double RETAIN_MARGIN_MS = 50.0;
+
+static double           retainMs(const STrail& p) {
+    double fade = 0.0;
+    for (const auto& l : p.layers)
+        if (!l->disabled && l->enabledSetting() && l->resolved() && nodeLayer(*l))
+            fade = std::max(fade, l->res.fadeMs);
+    return fade + RETAIN_MARGIN_MS;
+}
+
+// Longest a sampled step's births are spread over when no motion event marks
+// where it began (motion that sends none): beyond that the step is treated
+// as having taken this long. 100 ms covers a 10 Hz render.
+static constexpr double SAMPLE_GAP_MAX_MS = 100.0;
+
+// Sample the pointer once per render into the source ring: insert only on
+// real movement (at least min_spacing from the newest node, filled every
+// max_spacing, emitTo), after any warp nodes that came due (warp::sample). The trail follows the pointer whether
+// or not the cursor is shown.
+// Breaks: lock, pointer constraint and the app rule break
+// unconditionally; so do workspace events. Nothing is inserted while
+// suppressed(), and a playing warp is dropped. Warps break only when
+// warpMode == BREAK (hkControllerWarpTo).
+static void sampleSource(double nowMs) {
+    auto& p = *s_trail;
+    // First, so a full ring's next insert only counts a drop for a node a
+    // layer still draws.
+    p.source->expire(nowMs, retainMs(p));
+    if (suppressed()) {
+        p.pendingBreak = true;
+        p.warpPlayback.clear();
+        return;
+    }
+
+    // The step since the newest node is spread over the time the pointer
+    // was actually moving: from the first motion event after that node (not
+    // the rest before it), and no further back than SAMPLE_GAP_MAX_MS
+    // without one.
+    const double fromMs     = std::max(nowMs - SAMPLE_GAP_MAX_MS, p.motionSinceInsertMs.value_or(-std::numeric_limits<double>::infinity()));
+    const auto   generation = p.source->generation();
+    hyprtail::warp::sample(*p.source, p.warpPlayback, emitPoint(p), fromMs, nowMs, p.settings.minSpacingPx, p.settings.maxSpacingPx, p.pendingBreak);
+    if (p.source->generation() != generation)
+        p.motionSinceInsertMs.reset();
+}
+
+// Per-render lifecycle for one monitor: prepare layers, sample the source,
+// then for every layer damage prev ∪ cur and collect what to
+// draw. Runs exactly once per render of pMonitor (ctx), from the cursor hook
+// when the cursor is drawn, else from RENDER_LAST_MOMENT.
+static void runLifecycle(RenderCtx& ctx, const PHLMONITOR& pMonitor) {
+    auto&        p     = *s_trail;
+    const double nowMs = msSinceEpoch(Time::steadyNow());
+
+    prepareLayers();
+
+    // Core keeps drawing the cursor over the lock screen (Renderer.cpp:2176
+    // vs :2212-2216). This deliberately diverges from core: nothing while
+    // locked. Nothing over an excluded window either; the damage
+    // update below then clears what was drawn, once. Every layer, trail and
+    // idle alike, goes through this one check.
+    const bool hardGated = sessionLocked() || pointerExcluded();
+    sampleSource(nowMs);
+
+    // Advance the source to this render's instant. One that was at rest at
+    // the last tick has no motion to integrate over the gap since (idle
+    // time, not motion), so the first tick after it wakes has no elapsed
+    // time. Still runs while suppressed or locked: a moving source finishes
+    // settling either way. Every monitor's render ticks with the time since
+    // the last tick of any monitor, so the ticks add up to wall-clock time
+    // once; a spring chain integrates that in fixed steps, so neither the
+    // render rate nor the number of monitors changes its motion.
+    p.source->tick(nowMs, p.animating ? nowMs - p.lastTickMs : 0.0);
+    p.lastTickMs = nowMs;
+    p.animating  = p.source->needsContinuousUpload();
+
+    noteMotion(Pointer::mgr()->position(), nowMs);
+    // A warp's stillness starts when it has drawn (insertWarpNodes); one
+    // that stopped early (a break, a mode change, a flush) starts it now.
+    if (p.warpPlayback.empty() && p.lastMotionMs > nowMs) {
+        p.lastMotionMs = nowMs;
+        armIdleTimer();
+    }
+    const Vector2D anchor = quadAnchor(p);
+
+    // While a warp plays, node layers also damage where its nodes are still
+    // to appear: that keeps renders coming until the queue is empty, even
+    // when nothing drawn so far is visible.
+    const auto              pendingWarp = p.warpPlayback.bounds();
+
+    const bool              hidden = cursorHidden();
+    auto&                   mf     = s_monFrame[pMonitor.get()];
+    std::vector<SLayerDraw> draws;
+    bool                    skipped = false;
+
+    for (auto& lp : p.layers) {
+        auto& l      = *lp;
+        CBox  cur    = {};
+        float extent = 0.F;
+
+        if (!hardGated && layerDrawable(l, hidden)) {
+            extent = layerExtentPx(l);
+            if (nodeLayer(l)) {
+                // An instanced layer draws the visible nodes only (a path
+                // layer also draws the segment to the next older one), so
+                // its box leaves that node out.
+                // Nothing to damage once the source is settled for this
+                // layer's fade: stopped moving, everything faded.
+                const bool olderNode = l.topology() == eTopology::PATH;
+                auto       b         = (p.gpuFailed || p.source->isSettled(nowMs, l.res.fadeMs)) ? std::nullopt : p.source->visibleBounds(nowMs, l.res.fadeMs, olderNode);
+                if (pendingWarp && !p.gpuFailed)
+                    b = b ? STrailBounds{std::min(b->x1, pendingWarp->x1), std::min(b->y1, pendingWarp->y1), std::max(b->x2, pendingWarp->x2), std::max(b->y2, pendingWarp->y2)} :
+                            *pendingWarp;
+                if (b)
+                    cur = CBox{b->x1 - extent - pMonitor->m_position.x, b->y1 - extent - pMonitor->m_position.y, (b->x2 - b->x1) + 2.0 * extent, (b->y2 - b->y1) + 2.0 * extent};
+            } else if (!suppressed() && quadInWindow(l, nowMs))
+                cur = quadBoxLocal(anchor, extent, pMonitor->m_position);
+        }
+
+        // While visible, damage prev ∪ cur every frame (addDamage keeps frames
+        // coming); once empty, prev is damaged once to clear it, then the
+        // monitor can go idle.
+        if (!l.damage.update(ctx, pMonitor, cur)) {
+            skipped = true; // workspace not rendered this frame, see CMonitorDamage
+            continue;
+        }
+        if (cur.empty() || !cur.overlaps(CBox{{}, pMonitor->m_size}))
+            continue;
+        draws.push_back({.layer = &l, .boxLocal = cur, .extentPx = extent});
+    }
+
+    if (skipped)
+        ++mf.emptySkips;
+    if (draws.empty())
+        return;
+
+    // Screenshare exclude: while this monitor needs a mirror/
+    // capture copy, skip the normal pass element (it runs and draws before
+    // end()'s copy, Renderer.cpp:2160-2229 vs OpenGL.cpp:801-806 -- too
+    // early, it would be baked into the copy) and stash the draws for
+    // onMirrorSaved() instead, which runs after the copy. If the
+    // hook isn't installed, or the RENDER_POST self-check already caught it
+    // missing a previous render, fall back to not drawing at all: the
+    // damage.update() calls above already ran, so the region simply
+    // redraws without a trail, no artifacts.
+    if (excludeCaptures() && pMonitor->needsACopyFB()) {
+        if (s_captureHook && !mf.captureHookUnavailable) {
+            mf.pendingCaptureDraws = std::move(draws);
+            mf.pendingCaptureNowMs = nowMs;
+            mf.awaitingCaptureDraw = true;
+            ++mf.draws; // deferred, not skipped: it's still drawn, just later
+        }
+        return;
+    }
+
+    hyprtail::compat::addPassElement(ctx, makeUnique<CLayerPassElement>(&p, std::move(draws), nowMs));
+    ++mf.draws;
+}
+
+// Timer fired: a quad layer's window may have opened. Damage its square (not
+// just scheduleFrame: a frame without damage skips the workspace, see
+// CMonitorDamage) so a render happens and the lifecycle draws it.
+static int onIdleTimer(void*) {
+    hyprtail::diag::guard("idle-timer", [] {
+        if (!s_trail || suppressed())
+            return;
+        const bool hidden = cursorHidden();
+        for (const auto& l : s_trail->layers) {
+            if (!layerDrawable(*l, hidden) || l->topology() != eTopology::QUAD)
+                continue;
+            for (const auto& m : State::monitorState()->monitors()) {
+                if (!m || !m->m_enabled || m->isMirror())
+                    continue;
+                hyprtail::damageOutsideRender(m, quadBoxLocal(quadAnchor(*s_trail), layerExtentPx(*l), m->m_position));
+            }
+        }
+    });
+    return 0;
+}
+
+// 60s after a startup that got this far, the crash-loop window is over:
+// remove our marker so a later crash, or a plain `hyprctl plugin unload`,
+// doesn't leave a stale refusal behind for the next load. One-shot, not
+// re-armed -- unlike the idle timer, this only ever needs to fire once per
+// load.
+static int onCrashGuardTimer(void*) {
+    hyprtail::diag::guard("crash-guard-timer", [] { hyprtail::crashguard::removeMarker(); });
+    return 0;
+}
+
+// A report batch (load, config reload, user trail or shader file save) is complete once
+// every shader reload it queued has been compiled or discarded, which only
+// happens inside a render (CShaderSlot::prepare). Layers that are off don't
+// compile; the batch timeout in diag covers anything else.
+static void maybeEndBatch() {
+    if (!hyprtail::diag::batchOpen() || !s_trail)
+        return;
+    const bool settled = std::ranges::all_of(s_trail->layers, [](const auto& l) { return l->disabled || !l->enabledSetting() || !l->slot.hasPending(); });
+    if (settled)
+        hyprtail::diag::endBatch();
+}
+
+// Lifecycle behind an exception guard. Runs inside a render (GL current), so
+// on failure every layer is disabled and GPU resources released here.
+static void runLifecycleGuarded(RenderCtx& ctx, const PHLMONITOR& pMonitor, std::string_view where) {
+    if (!hyprtail::diag::guard(where, [&] { runLifecycle(ctx, pMonitor); })) {
+        for (auto& l : s_trail->layers)
+            l->disabled = true;
+        trailReleaseGpu(*s_trail);
+    }
+    maybeEndBatch();
+}
+
+// Draw order: renderMonitor adds the cursor texture inside
+// renderSoftwareCursorsFor (Renderer.cpp:2216), after windows, layers, lock
+// screen, IME and overlays, and before the DPMS overlay and RENDER_LAST_MOMENT.
+// Pass elements draw in add order (Pass.cpp:27-29), so running the lifecycle
+// *before* the original puts the layers directly beneath the software cursor.
+// With a hardware cursor the original draws nothing and the cursor plane is
+// above the composited frame anyway.
+// Handler for compat's detour (hooks::cursorDetour), which runs it before the
+// original and then always runs the original, unwrapped, so Hyprland's own
+// behavior is unchanged. Only this part is guarded.
+static void onCursorRender(RenderCtx& ctx, const PHLMONITOR& pMonitor, bool screencopy) {
+    // Screenshare calls this with fake damage (ScreenshareFrame.cpp:312, :355).
+    // Stay out.
+    if (screencopy || !g_pHyprRenderer || !s_trail || !pMonitor || pMonitor->isMirror())
+        return;
+    hyprtail::diag::guard("cursor-hook", [&] {
+        // Marked handled even if the lifecycle fails below, so the fallback
+        // doesn't rerun a failing lifecycle in the same render.
+        auto& mf         = s_monFrame[pMonitor.get()];
+        mf.handledSerial = mf.renderSerial;
+        ++mf.hookRuns;
+        runLifecycleGuarded(ctx, pMonitor, "cursor-hook-lifecycle");
+    });
+}
+
+// The warp's timing curve, built from the source's warp_p1/warp_p2 when its
+// settings resolve (applyPendingState()). The returned function shares the
+// curve for the one warp it's built for. Evaluation is getYForPoint
+// (hyprutils BezierCurve.cpp:55-103): exact 0 and 1 at the ends, overshoot
+// (y outside 0..1) kept in between. At hyprutils v0.14.2 (a21e87b), the
+// host's version.
+static hyprtail::warp::FEase warpEase(const STrail& p) {
+    if (!p.warpCurve)
+        return {};
+    return [curve = p.warpCurve](float x) { return curve->getYForPoint(x); };
+}
+
+// Defined with the motion handlers below.
+static void damageForMotion(const STrailBounds& b);
+
+// Warp interpolation: nodes on the CPU along the path from the trail's
+// current end to `target`, so damage stays exact and every topology works
+// without special casing -- the same argument as `path smooth N`'s
+// CPU-computed control points. Both ends are emit points: the newest node
+// came from a sample or an earlier warp, and `target` is the post-warp
+// emitPoint(). The nodes are queued with births over the warp's duration
+// (warp_speed, warp_max_ms) and inserted as they come due through the same
+// spacing rule as motion (warp::start, warp::sample); `pointer` is
+// the raw post-warp position, for the playback head in pointer space. A
+// spring chain queues nothing: it moves as one body by the jump
+// (ISource::warp), so shape, the warp timing and the easing don't apply to it.
+// The area still to be drawn is damaged here, so a render happens even when
+// nothing else asks for one; each render then damages it again until the
+// queue is empty (runLifecycle).
+static void insertWarpNodes(STrail& p, hyprtail::warp::eShape shape, const SVec2f& target, const Vector2D& pointer, double nowMs, const hyprtail::warp::FEase& ease) {
+    const SVec2f offset{.x = sc<float>(pointer.x) - target.x, .y = sc<float>(pointer.y) - target.y};
+    const auto&  st = p.settings;
+    hyprtail::warp::start(*p.source, p.warpPlayback, shape, target, offset, nowMs, st.warpSpeed, st.warpMaxMs, st.minSpacingPx, st.maxSpacingPx, ease);
+    if (const auto b = p.warpPlayback.bounds())
+        damageForMotion(*b);
+
+    // Quad layers wait for the pointer to be still from when the warp has
+    // drawn, so they never show at the moving playback head.
+    if (!p.warpPlayback.empty()) {
+        p.lastMotionMs = std::max(p.lastMotionMs, p.warpPlayback.endMs());
+        armIdleTimer();
+    }
+}
+
+// Programmatic warps (dispatchers, layouts, focus changes) go through here
+// (PointerController.cpp:16-29). warpMode decides what happens to the trail:
+// break starts a new segment; line and curve insert their nodes here, along
+// the chord or a Bezier, timed by warp_speed, warp_max_ms and warp_p1/warp_p2. Only that decision
+// is ours; the original always runs, unwrapped.
+// Coverage gap: warp sites that call CPointerManager::warpTo directly bypass
+// this and always connect (PointerWarp.cpp:76, InputCapture.cpp:206,
+// InputManager.cpp:2248, WorkspacePlacementController.cpp:356).
+// Pointer constraints also warp through here (locked: back to the hint on
+// every motion, InputManager.cpp:318-320; confined: clamped at the region
+// edge, :306). Those are ignored: no trail while constrained anyway.
+static void hkControllerWarpTo(const void* thisptr, const Vector2D& pos, bool force) {
+    Vector2D from;
+    hyprtail::diag::guard("warp-hook-pre", [&] { from = Pointer::mgr()->position(); });
+
+    reinterpret_cast<origControllerWarpTo>(s_warpHook->m_original)(thisptr, pos, force);
+
+    hyprtail::diag::guard("warp-hook", [&] {
+        // Actual result, not the target: with cursor:no_warps nothing moves.
+        const Vector2D to    = Pointer::mgr()->position();
+        const double   nowMs = msSinceEpoch(Time::steadyNow());
+        noteMotion(to, nowMs);
+
+        // Suppressed (locked, constrained, over an excluded window): nothing
+        // is inserted, as for sampled motion.
+        if (!s_trail || to == from || suppressed())
+            return;
+
+        // Where the trail's side of the warp ends: the emit point, the same
+        // point the next sample computes, so that sample finds the newest
+        // node already there and inserts nothing (no extra segment from the
+        // raw pointer to the emit point). Read after the original ran:
+        // CPointerManager::warpTo sets m_pointerPos synchronously
+        // (PointerManager.cpp:823), which both position() and
+        // getCursorBoxGlobal() read (:108-110, :719-721). The cursor image is
+        // the pre-warp one; a client's later shape change breaks the trail
+        // anyway when emit_from is normalized. `to` stays the
+        // raw pointer for the motion check and the quad anchor.
+        const SVec2f target = emitPoint(*s_trail);
+
+        switch (s_trail->warpMode) {
+            // The next sample starts the new segment at its emit point.
+            case eWarpMode::BREAK:
+                s_trail->pendingBreak = true;
+                s_trail->warpPlayback.clear();
+                break;
+            // Timed by the source's warp curve. Nodes along the chord or the
+            // Bezier either way, so every topology sees a warp like movement.
+            case eWarpMode::LINE: insertWarpNodes(*s_trail, hyprtail::warp::eShape::LINE, target, to, nowMs, warpEase(*s_trail)); break;
+            case eWarpMode::CURVE: insertWarpNodes(*s_trail, hyprtail::warp::eShape::CURVE, target, to, nowMs, warpEase(*s_trail)); break;
+        }
+    });
+}
+static_assert(std::is_same_v<decltype(&hkControllerWarpTo), origControllerWarpTo>, "hkControllerWarpTo does not match hooks::ControllerWarpTo in compat.hpp; change them together");
+
+// Screenshare exclude. Handler for compat's detour of
+// CHyprOpenGLImpl::saveBufferForMirror (hooks::mirrorDetour), run after the
+// original. Called from CHyprOpenGLImpl::end() (OpenGL.cpp:801-802) exactly
+// when this monitor needsACopyFB(): the original takes the mirror/capture
+// copy from currentFB first; we then draw directly into currentFB, which is
+// current again once the original's own bindTempFB guard unwinds
+// (OpenGL.cpp:2540-2541, 2556-2558). end() copies that same framebuffer to
+// the real output right after (:808-829), so the trail still reaches the
+// screen, just not the copy that was already taken. On main end() passes its
+// own context, still live: the reset comes later, in finishRender (main
+// OpenGL.cpp:827-832, GLRenderer.cpp:147, Renderer.cpp:1928-1932).
+//
+// The render data's damage isn't set explicitly here -- it doesn't need to be.
+// By this point it holds finalDamage (OpenGL.cpp:786), which traces back
+// through GLRenderer.cpp:88 (m_renderPass.render(m_renderData.damage)) and
+// Pass.cpp:132/163/172 to the same render's damage accumulator our own
+// damageInRender() added this monitor's layer boxes to earlier this render,
+// in runLifecycle(), well before endRender(). finalDamage is always a
+// superset of that (blur-widened at most, never narrower), so scissoring to
+// it can't crop our draw -- only be marginally wider than the tightest
+// per-element region Pass.cpp:193-194 would normally compute.
+static void onMirrorSaved(RenderCtx& ctx) {
+    if (!g_pHyprRenderer || !s_trail)
+        return;
+    const auto pMonitor = hyprtail::compat::renderData(ctx).pMonitor.lock();
+    if (!pMonitor)
+        return;
+
+    hyprtail::diag::guard("capture-hook", [&] {
+        auto& mf = s_monFrame[pMonitor.get()];
+        if (!mf.awaitingCaptureDraw)
+            return; // this monitor didn't defer anything this render
+        mf.awaitingCaptureDraw = false;
+        if (!mf.pendingCaptureDraws.empty()) {
+            CLayerPassElement el(s_trail.get(), std::move(mf.pendingCaptureDraws), mf.pendingCaptureNowMs);
+            el.drawWith(ctx);
+        }
+        mf.pendingCaptureDraws.clear();
+    });
+}
+
+// pMonitor is the monitor being rendered, from the event (compat), never from
+// ctx: on main there is no context at RENDER_POST. ctx is null there and at
+// RENDER_PRE on main; the token on the pin. No monitor (on the pin: a
+// RENDER_POST whose render never reached RENDER_LAST_MOMENT) skips the stage,
+// so that self-check is neither run nor counted.
+static void onRenderStageInternal(eRenderStage stage, const PHLMONITOR& pMonitor, RenderCtx* ctx) {
+    if ((stage != RENDER_BEGIN && stage != RENDER_LAST_MOMENT && stage != RENDER_POST) || !g_pHyprRenderer || !s_trail)
+        return;
+
+    if (!pMonitor || pMonitor->isMirror())
+        return;
+
+    auto& mf = s_monFrame[pMonitor.get()];
+
+    // RENDER_BEGIN (Renderer.cpp:2160) opens a new render of this monitor.
+    // No return path between it, the cursor call (:2216) and
+    // RENDER_LAST_MOMENT (:2227).
+    if (stage == RENDER_BEGIN) {
+        ++mf.renderSerial;
+        return;
+    }
+
+    // RENDER_POST (:2250), after endRender() -- and so after end() and its
+    // saveBufferForMirror call -- has already run. Self-check:
+    // if runLifecycle() stashed draws for the capture hook this render but
+    // they're still sitting here unconsumed, the hook never fired (a future
+    // build could inline a second copy of end() our export-based hook, S1,
+    // can't catch). Fall back for this monitor from now on: don't draw while
+    // it needs a copy, rather than risk the trail leaking into one. Counted
+    // (postChecks), so a self-check that silently stops running shows.
+    if (stage == RENDER_POST) {
+        ++mf.postChecks;
+        if (mf.awaitingCaptureDraw) {
+            mf.awaitingCaptureDraw    = false;
+            mf.captureHookUnavailable = true;
+            mf.pendingCaptureDraws.clear();
+            hyprtail::diag::report(
+                eSeverity::WARN, "hook:capture:" + pMonitor->m_name,
+                std::format("the screenshare-exclude hook didn't fire for {} this render; falling back to not drawing there while it needs a mirror/capture copy.",
+                            pMonitor->m_name));
+        }
+        return;
+    }
+
+    ++s_frames;
+    if (s_frames <= 3 || s_frames % 600 == 0)
+        hyprtail::compat::log(Log::INFO, "render #{} monitor={} via {}", s_frames, pMonitor->m_name, mf.handledSerial == mf.renderSerial ? "cursor hook" : "last-moment fallback");
+
+    // Fallback: the cursor hook didn't run for this render, i.e. the cursor is
+    // hidden (Renderer.cpp:2212). Nothing is drawn above us then, so order
+    // doesn't matter (except the DPMS overlay, rare). RENDER_LAST_MOMENT
+    // always has a context on main (Renderer.cpp:2424 there); without one
+    // there is nothing to draw into.
+    if (mf.handledSerial != mf.renderSerial && ctx) {
+        ++mf.fallbackRuns;
+        runLifecycleGuarded(*ctx, pMonitor, "last-moment-lifecycle");
+    }
+}
+
+static void onRenderStage(eRenderStage stage, const PHLMONITOR& pMonitor, RenderCtx* ctx) {
+    hyprtail::diag::guard("render-stage", [&] { onRenderStageInternal(stage, pMonitor, ctx); });
+}
+
+// Whether to skip scheduling a render for pointer motion on this monitor.
+// Core's check (Monitor.cpp:1161-1169) is
+//   (!shouldRenderCursor || noBreak) && adaptiveSync
+// With the cursor shown that's only the fullscreen no-break case, so use it
+// as is. With the cursor hidden it would skip on every adaptive-sync output,
+// fullscreen or not (core has no cursor to draw then), but the trail still
+// follows the pointer. Keep only the fullscreen part: skip when adaptive sync
+// is on and the monitor has a fullscreen window, regardless of
+// cursor:no_break_fs_vrr, so fullscreen VRR is never broken.
+static bool skipMotionFrame(const PHLMONITOR& m) {
+    if (!cursorHidden())
+        return m->shouldSkipScheduleFrameOnMouseEvent();
+
+    return m->m_output && m->m_output->state->state().adaptiveSync && Fullscreen::controller()->getFullscreenWindow(m);
+}
+
+// Damage the global box `b`, grown by the widest path or instanced layer's
+// reach, on every monitor it touches, so a render happens there and the
+// normal lifecycle samples and damages the layers. Before any program is
+// compiled the reach is a small default: the first render sizes it.
+static void damageForMotion(const STrailBounds& b) {
+    float r = 0.F;
+    for (const auto& l : s_trail->layers) {
+        if (!l->disabled && l->resolved() && nodeLayer(*l))
+            r = std::max(r, layerExtentPx(*l));
+    }
+    if (r <= 0.F)
+        r = 8.F;
+
+    for (const auto& m : State::monitorState()->monitors()) {
+        if (!m || !m->m_enabled || m->isMirror())
+            continue;
+
+        // Don't break fullscreen VRR, see skipMotionFrame.
+        if (skipMotionFrame(m))
+            continue;
+
+        const CBox local{b.x1 - r - m->m_position.x, b.y1 - r - m->m_position.y, (b.x2 - b.x1) + 2.0 * r, (b.y2 - b.y1) + 2.0 * r};
+        if (!local.overlaps(CBox{{}, m->m_size}))
+            continue;
+
+        hyprtail::damageOutsideRender(m, local);
+    }
+}
+
+// Hardware cursors: moving the cursor plane may not trigger a render at all
+// (Aquamarine's Wayland backend moveCursor is a no-op; DRM schedules one).
+// Damage a small box at the new point on each monitor it touches so a render
+// happens. Position is already updated when this fires (InputManager.cpp:155,
+// :269).
+static void onMouseMoveInternal() {
+    const Vector2D pos   = Pointer::mgr()->position();
+    const double   nowMs = msSinceEpoch(Time::steadyNow());
+
+    // Restart the stillness wait; quad layers end at the next render (the
+    // damage below makes one happen).
+    noteMotion(pos, nowMs);
+
+    // Where the next sampled step began (sampleSource).
+    if (s_trail && !s_trail->motionSinceInsertMs)
+        s_trail->motionSinceInsertMs = nowMs;
+
+    // Not suppressed(): over an excluded window the damage below still has to
+    // happen. It makes the render whose pre-render evaluation notices the
+    // pointer has left; skipping it would leave the gate shut until
+    // something else rendered.
+    if (!s_trail || sessionLocked() || pointerConstrained())
+        return;
+
+    const auto x = sc<float>(pos.x), y = sc<float>(pos.y);
+    damageForMotion(STrailBounds{x, y, x, y});
+}
+
+static void onMouseMove() {
+    hyprtail::diag::guard("mouse-move", [] { onMouseMoveInternal(); });
+}
+
+// Visible content changed underneath the pointer: workspace switch,
+// special workspace toggle, workspace moved to another monitor. The pointer
+// may also have been warped in the same call stack (Monitor.cpp:1497-1507),
+// before any render. Don't connect the old trail to the new position: the
+// next insert starts a new segment. Every other jump (e.g. a cross-monitor
+// focus warp) stays connected, which draws the straight "interpolated" sweep.
+static void onContentChanged() {
+    hyprtail::diag::guard("content-changed", [] {
+        if (s_trail)
+            s_trail->pendingBreak = true;
+    });
+}
+
+// ---------------------------------------------------------------- hotplug
+
+// Logical box of every enabled, non-mirror monitor. allMonitors() rather than
+// monitors(): the latter is fixed up by core's own layoutChanged listener
+// (MonitorState.cpp:32-46), which may run after ours.
+static std::unordered_map<Monitor::CMonitor*, CBox> currentLayout() {
+    std::unordered_map<Monitor::CMonitor*, CBox> out;
+    for (const auto& m : State::monitorState()->allMonitors()) {
+        if (!m || !m->m_enabled || m->isMirror())
+            continue;
+        out.emplace(m.get(), CBox{m->m_position, m->m_size});
+    }
+    return out;
+}
+
+// Monitor disabled (removed: Monitor.cpp:392-400, also by a monitor rule,
+// MonitorRuleManager.cpp:187) or destroyed (destroyMon: MonitorState.cpp:152-156,
+// after which the CMonitor can be freed and its address reused). Drops
+// everything keyed by it, so a new monitor at the same address starts clean.
+// Nothing else refers to the monitor: GL objects are global and pass
+// elements live for one render. A layer that was drawing on it simply stops
+// drawing there; the pointer is warped off it (Monitor.cpp:478-480), which
+// the warp hook turns into a break, a line, or a curve, per warpMode.
+static void onMonitorGone(const PHLMONITOR& pMonitor) {
+    hyprtail::diag::guard("monitor-removed", [&] {
+        if (!pMonitor)
+            return;
+        Monitor::CMonitor* m = pMonitor.get();
+        s_monFrame.erase(m);
+        s_layout.erase(m);
+        if (s_trail) {
+            for (auto& l : s_trail->layers)
+                l->damage.forget(m);
+        }
+    });
+}
+
+// Repaint what every layer drew last, on every monitor: monitor-local boxes,
+// still where the layers are on screen. Call after the source was cleared. The
+// next render of each monitor sees an empty source, damages those boxes once
+// more and goes idle; the ring damage here is what makes that render happen.
+static void repaintLastDrawn() {
+    for (const auto& m : State::monitorState()->allMonitors()) {
+        if (!m || !m->m_enabled || m->isMirror())
+            continue;
+        for (auto& l : s_trail->layers)
+            l->damage.damagePrev(m);
+    }
+}
+
+// Monitors arranged (MonitorLayoutController.cpp:70, Monitor.cpp:1399,
+// MonitorRuleManager.cpp:204). Nodes are global coordinates: if a monitor
+// moved, changed size (mode, scale, transform) or appeared, old points could
+// land somewhere else on screen until they fade, so the source is dropped.
+// Only then: arrange() also runs on config reloads that change nothing, and
+// those must not clear the trail. A monitor only disappearing needs nothing:
+// its points have no monitor to draw on.
+static void onLayoutChanged() {
+    hyprtail::diag::guard("layout-changed", [] {
+        auto       now     = currentLayout();
+        const bool changed = std::ranges::any_of(now, [](const auto& entry) {
+            const auto it = s_layout.find(entry.first);
+            return it == s_layout.end() || !(it->second == entry.second);
+        });
+        s_layout           = std::move(now);
+
+        if (!changed || !s_trail)
+            return;
+
+        s_trail->source->clear();
+        s_trail->warpPlayback.clear();
+        s_trail->pendingBreak = true;
+        repaintLastDrawn();
+        hyprtail::compat::log(Log::INFO, "monitor layout changed, trail cleared");
+    });
+}
+
+// The evaluation point for the per-app rule: state mutation, before
+// anything of this render is drawn or damaged (render.pre, Renderer.cpp:2095
+// at the pin; beginRender takes the damage ring only after it, :2140 and
+// :1782-1783, so ring damage added here lands in this very render). Hit
+// test once per render of a monitor, not per consumer: runLifecycle, the
+// motion check, the idle timer and the warp hook read the result through
+// pointerExcluded(). Monitors render on their own schedules, so there is no
+// frame shared by all of them; every pass sees the pointer and windows as
+// they are now, and the gate only acts when its answer changes, so the clear
+// and the damage happen once however many monitors render.
+static void onPreRenderInternal(const PHLMONITOR& pMonitor) {
+    if (!s_trail || !pMonitor || pMonitor->isMirror())
+        return;
+
+    switch (s_gate.update(windowExcluded(windowUnderPointer()), *s_trail->source)) {
+        case hyprtail::eGateEdge::NONE: return;
+        // The source is empty now (update() cleared it). Break so whatever
+        // comes next does not join an older node; and on entry repaint what
+        // was visible, on every monitor. Exit has nothing drawn to clear.
+        case hyprtail::eGateEdge::ENTER: repaintLastDrawn(); [[fallthrough]];
+        case hyprtail::eGateEdge::EXIT: s_trail->pendingBreak = true; break;
+    }
+}
+
+static void onPreRender(const PHLMONITOR& pMonitor) {
+    hyprtail::diag::guard("pre-render", [&] { onPreRenderInternal(pMonitor); });
+}
+
+// Extract function address from a non-virtual member function pointer.
+// Uses the Itanium C++ ABI layout: {ptr, adj}; virtual bit is the LSB of ptr.
+template <typename T>
+static void* pmfAddress(T pmf) {
+    struct SPmf {
+        uintptr_t ptr;
+        ptrdiff_t adj;
+    };
+    static_assert(sizeof(T) == sizeof(SPmf), "unexpected PMF size");
+    auto rep = std::bit_cast<SPmf>(pmf);
+    if (rep.ptr & 0x01)
+        return nullptr; // virtual: no fixed address to hook
+    return reinterpret_cast<void*>(rep.ptr);
+}
+
+static void removeHook(CFunctionHook*& hook) {
+    if (!hook)
+        return;
+    hook->unhook();
+    HyprlandAPI::removeFunctionHook(s_handle, hook);
+    hook = nullptr;
+}
+
+// Undo everything PLUGIN_INIT set up. Also used when init fails: Hyprland then
+// ejects the plugin without calling PLUGIN_EXIT (PluginSystem.cpp:147-150,
+// :122-125) and dlcloses it, so listeners and deferred callbacks pointing
+// into this .so must be gone before the exception leaves PLUGIN_INIT.
+static void teardown() noexcept {
+    hyprtail::diag::guard("teardown", [] {
+        // Stop callbacks first so nothing queues new elements during teardown.
+        if (s_statusCommand)
+            HyprlandAPI::unregisterHyprCtlCommand(s_handle, s_statusCommand);
+        s_statusCommand.reset();
+        if (s_noTrailEffectIdx != Desktop::Rule::WINDOW_RULE_EFFECT_NONE) {
+            Desktop::Rule::windowEffects()->unregisterEffect(s_noTrailEffectIdx);
+            s_noTrailEffectIdx = Desktop::Rule::WINDOW_RULE_EFFECT_NONE;
+        }
+        s_configReloadListener.reset();
+        s_fileWatch.shutdown();
+        if (s_idleTimer) {
+            wl_event_source_remove(s_idleTimer);
+            s_idleTimer = nullptr;
+        }
+        // Only removes the marker if it's ours (s_crashGuardTimer is only
+        // ever non-null after we wrote it, see pluginInit()) -- never a
+        // marker some other instance (sharing the same state directory) is
+        // still relying on.
+        if (s_crashGuardTimer) {
+            wl_event_source_remove(s_crashGuardTimer);
+            s_crashGuardTimer = nullptr;
+            hyprtail::crashguard::removeMarker();
+        }
+        s_workspaceActiveListener.reset();
+        s_specialActiveListener.reset();
+        s_workspaceMovedListener.reset();
+        s_monitorRemovedListener.reset();
+        s_monitorDestroyListener.reset();
+        s_layoutChangedListener.reset();
+        s_mouseMoveListener.reset();
+        s_cursorShapeListener.reset();
+        s_preRenderListener.reset();
+        s_renderStageListener.reset();
+        removeHook(s_cursorHook);
+        removeHook(s_warpHook);
+        removeHook(s_captureHook);
+
+        // Remove any queued elements before GPU resources go away so draw()
+        // can't run against a deleted VAO/program.
+        if (g_pHyprRenderer)
+            hyprtail::compat::removePassElementsOfType("CLayerPassElement");
+
+        if (s_trail) {
+            trailReleaseGpu(*s_trail);
+            s_trail.reset();
+        }
+        s_monFrame.clear();
+        s_layout.clear();
+        hyprtail::cfg::releaseValues();
+    });
+
+    // Last: cancels any pending deferred notification into this .so.
+    hyprtail::diag::shutdown();
+}
+
+// Returns an active hook, or nullptr with nothing left registered.
+static CFunctionHook* installHook(void* target, void* detour) {
+    CFunctionHook* hook = target ? HyprlandAPI::createFunctionHook(s_handle, target, detour) : nullptr;
+    if (hook && hook->hook())
+        return hook;
+    if (hook)
+        HyprlandAPI::removeFunctionHook(s_handle, hook);
+    return nullptr;
+}
+
+// Hooks degrade instead of refusing to load: each failure is reported with
+// what stops working.
+static void installHooks() {
+    // Draw order. Without it RENDER_LAST_MOMENT runs the lifecycle every
+    // render and the layers draw above the cursor.
+    s_cursorHook = installHook(pmfAddress(&Pointer::CPointerManager::renderSoftwareCursorsFor), hyprtail::compat::hooks::cursorDetour<&onCursorRender, s_cursorHook>());
+    if (!s_cursorHook)
+        hyprtail::diag::report(eSeverity::WARN, "hook:cursor",
+                               "could not hook CPointerManager::renderSoftwareCursorsFor. Running degraded: the trail draws above the cursor instead of beneath it.");
+
+    // Warp detection for warpMode != line. Without it every warp connects
+    // (straight sweep).
+    s_warpHook = installHook(pmfAddress(&Pointer::CPointerController::warpTo), reinterpret_cast<void*>(&hkControllerWarpTo));
+    if (!s_warpHook)
+        hyprtail::diag::report(eSeverity::WARN, "hook:warp", "could not hook CPointerController::warpTo. Warps will draw a connecting line instead of breaking the trail.");
+
+    // Screenshare exclude. Without it exclude mode degrades to
+    // not drawing on any monitor that needs a mirror/capture copy, same as
+    // the RENDER_POST self-check's own fallback (onRenderStageInternal).
+    s_captureHook = installHook(pmfAddress(&Render::GL::CHyprOpenGLImpl::saveBufferForMirror), hyprtail::compat::hooks::mirrorDetour<&onMirrorSaved, s_captureHook>());
+    if (!s_captureHook)
+        hyprtail::diag::report(
+            eSeverity::WARN, "hook:capture",
+            "could not hook CHyprOpenGLImpl::saveBufferForMirror. screenshare = \"exclude\" degrades to not drawing on monitors that need a mirror/capture copy.");
+}
+
+// Make a render happen soon, so a pending shader compiles (GL is only
+// current inside a render) and a changed setting shows.
+static void kickRender() {
+    if (!g_pHyprRenderer)
+        return;
+    if (auto m = g_pHyprRenderer->m_mostHzMonitor.lock())
+        m->scheduleFrame();
+}
+
+// ---------------------------------------------------------------- config
+
+// Shader paths of a layer at this position in the active trail: a
+// `layerN_vertex`/`layerN_fragment` override (N = 1-based) wins
+// per stage if set, else the active trail's own per-layer shader ("" for
+// an embedded shader, else the absolute path it resolved to). Both resolve
+// relative paths against the hyprtail config root (cfg::resolveShaderPath).
+static std::pair<std::string, std::string> layerShaderPaths(size_t index) {
+    std::pair<std::string, std::string> fromTrail;
+    if (index < s_trail->activeTrail.layers.size())
+        fromTrail = {s_trail->activeTrail.layers[index].vertPath, s_trail->activeTrail.layers[index].fragPath};
+
+    if (index >= s_config.layerVertex.size())
+        return fromTrail;
+    return {s_config.layerVertex[index].empty() ? fromTrail.first : s_config.layerVertex[index],
+            s_config.layerFragment[index].empty() ? fromTrail.second : s_config.layerFragment[index]};
+}
+
+// Re-read every layer's shader stages (config path, manifest path, or
+// built-in), preprocess them, and queue them for compilation at the next
+// render (CShaderSlot). Errors keep the active programs.
+//
+// Also sets what the file watch covers: the shader files and their includes
+// just read, plus the configured trail's file. That one by what `trail` names,
+// not by what is showing, so after a broken trail fell back to the built-in
+// one, saving the fix still reloads it. A built-in has no file.
+static void reloadShaders() {
+    std::vector<std::filesystem::path> watch;
+    for (size_t i = 0; i < s_trail->layers.size(); ++i) {
+        auto& l                 = s_trail->layers[i];
+        const auto [vert, frag] = layerShaderPaths(i);
+        l->slot.reload(vert, frag, watch);
+    }
+    if (!s_config.trail.starts_with("builtin:") && s_config.trail.ends_with(".conf")) {
+        if (const auto file = hyprtail::cfg::resolveShaderPath(s_config.trail); file.is_absolute())
+            watch.push_back(file);
+    }
+    s_fileWatch.setFiles(watch);
+    kickRender();
+}
+
+// Queues the configured trail; applyPendingState() switches to it at the
+// next render if it differs from the active one.
+static void loadTrail() {
+    auto& p = *s_trail;
+    // nullopt: the trail names shader files that aren't on disk and one is
+    // already showing; it stays (load() reported it).
+    if (auto loaded = hyprtail::trail::load(s_config.trail, !p.activeTrail.layers.empty()))
+        p.pendingTrail = std::move(*loaded);
+    else
+        p.pendingTrail.reset();
+}
+
+// Saving a watched file reloads it only while Hyprland's own config files
+// do: misc:disable_autoreload, the value core's watcher reads
+// (ConfigWatcher.cpp:32-35). Read per change rather than per config reload,
+// so `hyprctl keyword misc:disable_autoreload` counts at once, as it does
+// for core (HyprCtl.cpp:1223-1224). The CConfigValue is a local: it
+// registers itself and unregisters on scope exit (ConfigValue.cpp:26-32),
+// so nothing of ours stays in core's registry.
+static bool autoreloadDisabled() {
+    return *CConfigValue<Config::INTEGER>("misc:disable_autoreload") != 0;
+}
+
+// GL is current (called from prepareLayers(), before anything else):
+// applies whatever applyConfig() queued.
+//
+// A trail switch first: swaps `layers` to fresh CLayer objects built from
+// `pendingTrail` only if it actually differs from `activeTrail` (a
+// manifest re-parse with no real change, or an unrelated config reload, is
+// a no-op here), releasing the old layers' GL programs first (the shared
+// trail.gpu/quadVao are per-trail-*instance*, not per-trail-*definition*,
+// so they're left alone). Reconstructing here, rather than mutating an
+// existing CLayer's identity, is safe because a CLayerPassElement's raw
+// CLayer* pointers (SLayerDraw) are collected fresh every render, after
+// this point, and never outlive the render they were collected for.
+//
+// Then layerN's unused-index check and the `params` string, both against
+// whichever layers are now active -- so they're correct even the same
+// render a trail switch happens, not one render behind it.
+static void applyPendingState() {
+    auto& p = *s_trail;
+
+    if (p.pendingTrail && *p.pendingTrail != p.activeTrail) {
+        for (auto& l : p.layers)
+            l->slot.release();
+        p.layers.clear();
+        for (const auto& spec : p.pendingTrail->layers)
+            p.layers.push_back(makeUnique<hyprtail::CLayer>(spec));
+
+        // The source is kept, resized or replaced below, once its settings
+        // for the new trail are resolved.
+        p.sourceDirty = true;
+        p.activeTrail = *p.pendingTrail;
+        reloadShaders();
+    }
+    p.pendingTrail.reset();
+
+    // layer1_vertex .. layer4_fragment: an override for an
+    // index the active trail has no layer for is a plugin warning.
+    {
+        std::string unused;
+        for (size_t i = p.activeTrail.layers.size(); i < s_config.layerVertex.size(); ++i)
+            if (!s_config.layerVertex[i].empty() || !s_config.layerFragment[i].empty())
+                unused += std::format(" layer{}", i + 1);
+        if (!unused.empty())
+            hyprtail::diag::report(eSeverity::WARN, "config:plugin:hyprtail:layerN",
+                                   std::format("trail \"{}\" has {} layer(s); override(s) for{} ignored", p.activeTrail.name, p.activeTrail.layers.size(), unused));
+        else
+            hyprtail::diag::resetKey("config:plugin:hyprtail:layerN");
+    }
+
+    // `params` string: syntax problems and entries for an
+    // unknown layer are one batched warning; entries for a known layer are
+    // validated per-name/type/range in CLayer::resolve().
+    {
+        auto                                            parsed = hyprtail::params::parseParamsString(s_config.params);
+        std::string                                     unknownLayers;
+        std::vector<std::map<std::string, std::string>> perLayer(p.layers.size());
+        std::map<std::string, std::string>              sourceParams; // "source:<name>=<value>", the source's own
+        for (const auto& e : parsed.entries) {
+            if (e.layer == hyprtail::source::KEY_PREFIX) {
+                sourceParams[e.name] = e.value;
+                continue;
+            }
+            const auto it = std::ranges::find_if(p.layers, [&](const auto& l) { return l->name() == e.layer; });
+            if (it == p.layers.end()) {
+                if (!unknownLayers.contains(std::format(" \"{}\"", e.layer)))
+                    unknownLayers += std::format(" \"{}\"", e.layer);
+                continue;
+            }
+            perLayer[std::distance(p.layers.begin(), it)][e.name] = e.value;
+        }
+        for (size_t i = 0; i < p.layers.size(); ++i)
+            p.layers[i]->setParamOverrides(std::move(perLayer[i]));
+
+        // Applied live, only when they or the active trail changed. Resolved
+        // first, because the source is built or resized from its capacity.
+        if (p.sourceDirty || sourceParams != p.sourceOverrides) {
+            p.sourceOverrides = std::move(sourceParams);
+            p.sourceDirty     = false;
+
+            const auto& kind = p.activeTrail.sourceKind;
+            std::string problems;
+            p.settings = hyprtail::source::resolve(kind, p.activeTrail.sourceDefaults, p.sourceOverrides, problems);
+
+            // The same kind of source keeps its points across a trail switch
+            // (a different capacity keeps the newest that fit). A different
+            // kind replaces it, empty: the old trail is damaged away by this
+            // render's lifecycle (the new source has nothing to draw), a
+            // break keeps the first point from connecting to anything, and
+            // the node buffer forgets what it uploaded (generations are per
+            // source, a new source's could equal the old one's). Either way
+            // the VBO follows at the next draw (CNodeBuffer::ensure).
+            if (kind != p.source->kind()) {
+                p.source       = hyprtail::source::make(kind, p.settings.capacity, p.seedBase);
+                p.pendingBreak = true;
+                p.animating    = false;
+                p.gpu.invalidate();
+            } else if (p.source->capacity() != p.settings.capacity)
+                p.source->resize(p.settings.capacity);
+            p.source->configure(p.settings.values);
+
+            // Ends fixed at (0,0) and (1,1); setup() bakes the curve
+            // (hyprutils BezierCurve.cpp:11-35), so it's built here, not per
+            // warp. resolve() already clamped x to 0..1.
+            p.warpCurve = makeShared<Hyprutils::Animation::CBezierCurve>();
+            p.warpCurve->setup({Vector2D{p.settings.warpP1.x, p.settings.warpP1.y}, Vector2D{p.settings.warpP2.x, p.settings.warpP2.y}});
+
+            if (!problems.empty())
+                hyprtail::diag::report(eSeverity::WARN, "params:source", std::format("source {}: parameter problems:{}", kind, problems));
+            else
+                hyprtail::diag::resetKey("params:source");
+        }
+
+        if (!unknownLayers.empty()) {
+            std::string names;
+            for (const auto& l : p.layers)
+                names += (names.empty() ? "" : ", ") + l->name();
+            parsed.problems.push_back(std::format("unknown layer(s):{} (this trail has: {})", unknownLayers, names));
+        }
+        if (!parsed.problems.empty()) {
+            std::string msg;
+            for (const auto& prob : parsed.problems)
+                msg += "\n  " + prob;
+            hyprtail::diag::report(eSeverity::WARN, "config:plugin:hyprtail:params", std::format("plugin:hyprtail:params: problems:{}", msg));
+        } else
+            hyprtail::diag::resetKey("config:plugin:hyprtail:params");
+    }
+}
+
+// Config values -> trail, on load and every Hyprland config reload. GL
+// isn't guaranteed current here (a config reload isn't necessarily inside
+// a render), so this only resolves and queues; applyPendingState() (GL
+// current, from prepareLayers()) does the actual layer/shader work.
+static void applyConfig() {
+    auto& p  = *s_trail;
+    s_config = hyprtail::cfg::read(s_config);
+
+    // A warp still playing was laid out for the old mode.
+    if (p.warpMode != s_config.warp)
+        p.warpPlayback.clear();
+    p.warpMode     = s_config.warp;
+    p.emitFromNorm = s_config.emitFromNorm;
+    p.emitOffsetPx = s_config.emitOffsetPx;
+
+    // The source's capacity, spacing and warp timing come with the trail:
+    // applyPendingState() resolves them.
+    loadTrail();
+
+    reloadShaders();
+    armIdleTimer();
+    kickRender();
+}
+
+// ---------------------------------------------------------------- status
+
+static hyprtail::status::SSnapshot statusSnapshot() {
+    hyprtail::status::SSnapshot s;
+    s.rev         = HYPRTAIL_REV;
+    s.builtHash   = __hyprland_api_get_client_hash();
+    s.runningHash = __hyprland_api_get_hash();
+    s.cursorHook  = s_cursorHook != nullptr;
+    s.warpHook    = s_warpHook != nullptr;
+    s.captureHook = s_captureHook != nullptr;
+    s.renders     = s_frames;
+    s.trail       = s_trail ? s_trail->activeTrail.name : "";
+    s.screenshare = s_config.screenshare;
+
+    s.suppress.locked      = sessionLocked();
+    s.suppress.constrained = pointerConstrained();
+    s.suppress.appRule     = pointerExcluded();
+    if (const auto w = windowUnderPointer()) {
+        s.suppress.hoveredClass = hyprtail::compat::windowClass(*w);
+        s.suppress.hoveredTitle = hyprtail::compat::windowTitle(*w);
+    }
+
+    const double nowMs = msSinceEpoch(Time::steadyNow());
+
+    if (s_trail) {
+        const auto& p         = *s_trail;
+        s.source.kind         = std::string{p.source->kind()};
+        s.source.nodes        = p.source->size();
+        s.source.capacity     = p.source->capacity();
+        s.source.generation   = p.source->generation();
+        s.source.moving       = p.source->needsContinuousUpload();
+        s.source.pendingBreak = p.pendingBreak;
+        s.source.warpMode     = hyprtail::cfg::warpModeName(p.warpMode);
+        s.source.warpP1       = {p.settings.warpP1.x, p.settings.warpP1.y};
+        s.source.warpP2       = {p.settings.warpP2.x, p.settings.warpP2.y};
+        s.source.warpSpeed    = p.settings.warpSpeed;
+        s.source.warpMaxMs    = p.settings.warpMaxMs;
+        s.source.minSpacing   = p.settings.minSpacingPx;
+        s.source.maxSpacing   = p.settings.maxSpacingPx;
+        s.source.warpPending  = p.warpPlayback.pending();
+        if (const auto* ring = dynamic_cast<const CTrailRing*>(p.source.get())) {
+            s.source.keepMs       = retainMs(p);
+            s.source.ceilingDrops = ring->drops();
+        }
+        s.source.gpuFailed = p.gpuFailed;
+        s.source.stillMs   = std::max(0.0, nowMs - p.lastMotionMs);
+
+        for (const auto& l : p.layers) {
+            hyprtail::status::SLayer out{
+                .name     = l->name(),
+                .enabled  = l->enabledSetting(),
+                .disabled = l->disabled,
+                .resolved = l->resolved(),
+                .shader   = l->slot.status(),
+            };
+            if (l->resolved()) {
+                out.fadeMs     = l->res.fadeMs;
+                out.startMs    = l->res.startMs;
+                out.durationMs = l->res.durationMs;
+                out.extentPx   = layerExtentPx(*l);
+                for (const auto& [decl, v] : l->res.values)
+                    out.params.emplace_back(decl.name, hyprtail::params::format(v));
+            }
+            s.layers.push_back(std::move(out));
+        }
+    }
+
+    for (const auto& m : State::monitorState()->allMonitors()) {
+        if (!m)
+            continue;
+        hyprtail::status::SMonitor out{.name = m->m_name, .needsCopyFB = m->needsACopyFB()};
+        if (const auto it = s_monFrame.find(m.get()); it != s_monFrame.end()) {
+            const auto& mf      = it->second;
+            out.renders         = mf.renderSerial;
+            out.hookRuns        = mf.hookRuns;
+            out.fallbackRuns    = mf.fallbackRuns;
+            out.draws           = mf.draws;
+            out.emptySkips      = mf.emptySkips;
+            out.postChecks      = mf.postChecks;
+            out.captureFallback = mf.captureHookUnavailable;
+        }
+        if (s_trail) {
+            for (const auto& l : s_trail->layers)
+                out.layerBoxes.push_back(l->damage.prev(m.get()));
+        }
+        s.monitors.push_back(std::move(out));
+    }
+
+    s.diag      = hyprtail::diag::stats();
+    s.errorFile = hyprtail::diag::errorFilePath();
+    return s;
+}
+
+// `hyprctl hyprtail` (-j for JSON), an exact-match command (compat.hpp). The
+// reply is never empty: the pin treats an empty reply as "unknown request"
+// (HyprCtl.cpp:2123-2124), main only answers that when nothing matched
+// (ipc/s1/S1.cpp:107), and an empty reply would look like a failure to the
+// caller either way.
+static std::string statusCommand(bool json) {
+    std::string out;
+    const bool  ok = hyprtail::diag::guard("status-command", [&] {
+        const auto snap = statusSnapshot();
+        out             = json ? hyprtail::status::json(snap) : hyprtail::status::text(snap);
+    });
+    if (!ok || out.empty())
+        return json ? R"({"error": "hyprtail status failed, see errors.log"})" : "hyprtail status failed, see errors.log";
+    return out;
+}
+
+// ---------------------------------------------------------------- init / exit
+
+static PLUGIN_DESCRIPTION_INFO pluginInit() {
+    // Everything reported while loading ends up in one summary notification, once
+    // the first render has compiled the shaders.
+    hyprtail::diag::beginBatch("loading");
+
+    s_epoch  = Time::steadyNow();
+    s_config = {};
+
+    // Per-app suppression: a dynamic window-rule effect, read back
+    // per render, from the window under the pointer, via
+    // m_ruleApplicator->m_otherProps (windowExcluded()).
+    s_noTrailEffectIdx = Desktop::Rule::windowEffects()->registerEffect("hyprtail:no_trail");
+
+    // Node seeds: per-load random base, hashed with an
+    // insertion counter.
+    std::random_device rd;
+    const uint64_t     seedBase = (static_cast<uint64_t>(rd()) << 32) ^ rd();
+
+    // `layers` starts empty: applyConfig() below queues the configured
+    // trail (default "builtin:ink"), and the first prepareLayers() (the first
+    // render, GL current) builds it -- the same path a later trail switch
+    // takes, see applyPendingState().
+    s_trail                        = makeUnique<STrail>(seedBase);
+    s_trail->lastPos               = Pointer::mgr()->position();
+    s_trail->lastMotionMs          = 0.0;
+    s_trail->lastCursorHotspot     = Pointer::mgr()->hotspot();
+    s_trail->lastCursorSizeLogical = Pointer::mgr()->cursorSizeLogical();
+
+    // Stillness timer for quad layers on Hyprland's event loop (main thread),
+    // like the file watch.
+    if (g_pCompositor && g_pCompositor->m_wlEventLoop)
+        s_idleTimer = wl_event_loop_add_timer(g_pCompositor->m_wlEventLoop, &onIdleTimer, nullptr);
+    if (!s_idleTimer)
+        hyprtail::diag::report(eSeverity::WARN, "idle-timer", "could not create the idle timer; the idle effect only starts when something else renders");
+
+    // Crash-loop guard: a fresh marker for this load. The
+    // duplicate-instance-shaped refusal check in PLUGIN_INIT already ruled
+    // out that a prior marker for this exact build+Hyprland pair names a
+    // dead pid, so it's safe to overwrite whatever was (or wasn't) there.
+    // s_crashGuardTimer is armed only when the write actually succeeded, so
+    // its mere existence is teardown()'s signal that the marker is ours to
+    // remove.
+    {
+        const hyprtail::crashguard::SKey key{HYPRTAIL_REV, __hyprland_api_get_hash()};
+        const char*                      sig = std::getenv("HYPRLAND_INSTANCE_SIGNATURE");
+        if (!hyprtail::crashguard::writeMarker(key, sig ? sig : "unknown", ::getpid()))
+            hyprtail::diag::report(eSeverity::WARN, "crash-guard", "could not write the crash-loop marker; a crash before the next clean unload won't be caught");
+        else if (g_pCompositor && g_pCompositor->m_wlEventLoop) {
+            constexpr int CRASH_GUARD_CLEAR_MS = 60000;
+            s_crashGuardTimer                  = wl_event_loop_add_timer(g_pCompositor->m_wlEventLoop, &onCrashGuardTimer, nullptr);
+            if (s_crashGuardTimer)
+                wl_event_source_timer_update(s_crashGuardTimer, CRASH_GUARD_CLEAR_MS);
+        }
+    }
+
+    // Settings. Registered values get their configured value
+    // on the reload Hyprland schedules right after loading a plugin
+    // (PluginSystem.cpp:135); until then they hold the defaults.
+    hyprtail::cfg::registerValues(s_handle);
+    // A changed user trail or shader file: the trail is re-read too, so
+    // its own keys (source settings, parameter defaults, layer list) apply
+    // without a Hyprland reload.
+    s_fileWatch.init([] {
+        hyprtail::diag::guard("file-changed", [] {
+            if (autoreloadDisabled())
+                return;
+            hyprtail::diag::beginBatch("a file change");
+            loadTrail();
+            reloadShaders();
+        });
+    });
+    applyConfig();
+    s_configReloadListener = Event::bus()->m_events.config.reloaded.listen([] {
+        hyprtail::diag::guard("config-reload", [] {
+            hyprtail::diag::beginBatch("a config reload");
+            applyConfig();
+        });
+    });
+
+    // Cursor hook for draw order. The host (LTO) build calls the target out of
+    // line from renderMonitor, so the hook fires there too.
+    installHooks();
+
+    // Serial at RENDER_BEGIN, fallback lifecycle at RENDER_LAST_MOMENT. The
+    // cursor hook isn't called while the cursor is hidden
+    // (Renderer.cpp:2212-2216, 2976-2978), which would freeze a trail mid-fade.
+    s_renderStageListener = hyprtail::compat::listenRenderStage(&onRenderStage);
+
+    // The per-app rule is evaluated before the render starts.
+    s_preRenderListener = Event::bus()->m_events.render.pre.listen([](PHLMONITOR monitor) { onPreRender(monitor); });
+
+    s_mouseMoveListener = Event::bus()->m_events.input.mouse.move.listen([](Vector2D, Event::SCallbackInfo&) { onMouseMove(); });
+
+    // Shape change without motion moves the emit point. Gate on
+    // the box geometry (hotspot, logical size) actually differing:
+    // cursorChanged also fires for same-shape re-applies and every commit of
+    // an animated client cursor surface (PointerManager.cpp:135, 153, 165,
+    // 187, 201, 286), most of which don't move the box at all.
+    s_cursorShapeListener = Pointer::mgr()->m_events.cursorChanged.listen([] {
+        hyprtail::diag::guard("cursor-shape-changed", [] {
+            if (!s_trail)
+                return;
+            const Vector2D hotspot = Pointer::mgr()->hotspot();
+            const Vector2D size    = Pointer::mgr()->cursorSizeLogical();
+            if (hotspot == s_trail->lastCursorHotspot && size == s_trail->lastCursorSizeLogical)
+                return;
+            s_trail->lastCursorHotspot     = hotspot;
+            s_trail->lastCursorSizeLogical = size;
+            if (s_trail->emitFromNorm)
+                s_trail->pendingBreak = true;
+        });
+    });
+
+    // Teleport handling: break the polyline on content changes.
+    s_workspaceActiveListener = Event::bus()->m_events.workspace.active.listen([] { onContentChanged(); });
+    s_specialActiveListener   = Event::bus()->m_events.workspace.specialActive.listen([] { onContentChanged(); });
+    s_workspaceMovedListener  = Event::bus()->m_events.workspace.moveToMonitor.listen([] { onContentChanged(); });
+
+    // Hotplug (EventBus.hpp:158-169): per-monitor state is keyed by CMonitor*.
+    s_layout                 = currentLayout();
+    s_monitorRemovedListener = Event::bus()->m_events.monitor.removed.listen([](PHLMONITOR m) { onMonitorGone(m); });
+    s_monitorDestroyListener = Event::bus()->m_events.monitor.destroyMon.listen([](PHLMONITOR m) { onMonitorGone(m); });
+    s_layoutChangedListener  = Event::bus()->m_events.monitor.layoutChanged.listen([] { onLayoutChanged(); });
+
+    s_statusCommand = hyprtail::compat::registerStatusCommand(s_handle, "hyprtail", statusCommand);
+    if (!s_statusCommand)
+        hyprtail::diag::report(eSeverity::WARN, "hyprctl", "could not register the `hyprctl hyprtail` status command");
+
+    hyprtail::compat::log(Log::INFO, "{} loaded, cursor hook {}, warp hook {}", HYPRTAIL_REV, s_cursorHook ? "active" : "unavailable", s_warpHook ? "active" : "unavailable");
+    HyprlandAPI::addNotification(s_handle, std::format("[hyprtail] loaded ({})", HYPRTAIL_REV), CHyprColor{0.2f, 1.0f, 0.2f, 1.0f}, 3000);
+
+    // Damage the primary monitor to schedule an immediate first frame.
+    if (g_pHyprRenderer) {
+        if (auto m = g_pHyprRenderer->m_mostHzMonitor.lock())
+            g_pHyprRenderer->damageMonitor(m);
+    }
+
+    return {"hyprtail", "Cursor trail (ribbon, beneath the cursor)", "dev", HYPRTAIL_VERSION "-" HYPRTAIL_REV};
+}
+
+// Another hyprtail already loaded (a different build from another path: the
+// plugin system only refuses the same path twice, PluginSystem.cpp:72-75).
+// Two copies would fight over the config keys and hooks. Loaded plugins are
+// CPlugin entries (PluginSystem.hpp:14-25) listed by getAllPlugins()
+// (:45, PluginSystem.cpp:260-265). Our own entry is already in the list
+// during PLUGIN_INIT, with m_path/m_handle set but m_name still empty (it's
+// filled from our return value afterwards, :128-131), so it's excluded by
+// handle. Older builds named themselves "hyprtail-stageN".
+static const CPlugin* findOtherInstance(HANDLE self) {
+    if (!g_pPluginSystem)
+        return nullptr;
+    for (const CPlugin* p : g_pPluginSystem->getAllPlugins()) {
+        if (!p || p->m_handle == self)
+            continue;
+        if (p->m_name == "hyprtail" || p->m_name.starts_with("hyprtail-stage"))
+            return p;
+    }
+    return nullptr;
+}
+
+// Whether this load comes from the Lua config's hl.plugin.load list. Hyprland
+// then shows its own "failed to load" notification with our exception text
+// (PluginSystem.cpp:229-230); loads through hyprctl or hyprpm show nothing
+// (HyprCtl.cpp:1824-1840 only returns the error; hyprpm ignores the reply,
+// hyprpm PluginManager.cpp loadUnloadPlugin), so we notify ourselves there.
+// The Lua manager's m_registeredPlugins is public (lua/ConfigManager.hpp:131);
+// the legacy one keeps its list private, so there we can't tell and notify.
+static bool loadedFromLuaConfig(HANDLE self) {
+    if (!Config::mgr() || Config::mgr()->type() != Config::CONFIG_LUA || !g_pPluginSystem)
+        return false;
+    const CPlugin* me = g_pPluginSystem->getPluginByHandle(self);
+    if (!me)
+        return false;
+    // The type() == CONFIG_LUA check above is what makes this downcast valid
+    // (IConfigManager::type, ConfigManager.hpp:41).
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+    const auto& list = static_cast<Config::Lua::CConfigManager*>(Config::mgr().get())->m_registeredPlugins;
+    return std::ranges::find(list, me->m_path) != list.end();
+}
+
+APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
+    s_handle = handle;
+
+    // Checked before anything else, including diag::init, which would
+    // rotate away the other instance's errors.log. Nothing is registered yet,
+    // so no teardown is needed: one notification, then a std::exception,
+    // which is how a plugin refuses to load (Hyprland catches it and ejects
+    // the plugin, PluginSystem.cpp:113-126).
+    if (const CPlugin* other = findOtherInstance(handle)) {
+        const bool viaHyprpm = other->m_path.starts_with("/var/cache/hyprpm/");
+        const auto msg = std::format("another hyprtail ({} {}) is already loaded from {}. Unload it first ({}), then load this one.", other->m_name, other->m_version,
+                                     other->m_path, viaHyprpm ? "hyprpm disable hyprtail, or hyprctl plugin unload " + other->m_path : "hyprctl plugin unload " + other->m_path);
+        // Exactly one notification: Hyprland's own for config loads, ours
+        // otherwise.
+        if (!loadedFromLuaConfig(handle))
+            HyprlandAPI::addNotification(handle, "[hyprtail] not loaded: " + msg, CHyprColor{1.0f, 0.2f, 0.2f, 1.0f}, 15000);
+        throw std::runtime_error("[hyprtail] " + msg);
+    }
+
+    // Crash-loop guard, checked here for the same reason as the
+    // duplicate-instance check above: before diag::init, which would
+    // otherwise rotate away the crashed session's errors.log -- the one
+    // file that explains what happened. A marker naming this exact build
+    // and this exact running Hyprland, whose pid is no longer alive, means
+    // the load it belongs to never reached teardown() (a clean unload or a
+    // caught init failure both remove it there). A live pid means some
+    // other instance sharing the same state directory (e.g. a nested one)
+    // is still in its own run, not a crash: ignored, not refused.
+    const std::string compositorHash = __hyprland_api_get_hash();
+    if (const auto marker = hyprtail::crashguard::readMarker(); marker && hyprtail::crashguard::indicatesEarlyDeath(*marker, {HYPRTAIL_REV, compositorHash})) {
+        const auto errLog = hyprtail::stateDir() / "errors.log";
+        const auto msg = std::format("refusing to load: the previous session (pid {}, instance {}) of this build never reached a clean unload. See {}. Delete {} to load anyway.",
+                                     marker->pid, marker->instanceSignature, errLog.string(), hyprtail::crashguard::markerPath().string());
+        HyprlandAPI::addNotification(handle, "[hyprtail] " + msg, CHyprColor{1.0f, 0.2f, 0.2f, 1.0f}, 15000);
+        throw std::runtime_error("[hyprtail] " + msg);
+    }
+
+    hyprtail::diag::init(handle);
+
+    // Refusing to load is done by throwing. Hyprland only catches
+    // std::exception from init (PluginSystem.cpp:121), so nothing else may
+    // leave, and teardown must run first. Failures here notify synchronously:
+    // the deferred path would be cancelled by teardown before it runs.
+    try {
+        // ABI version check — must match the compositor we were compiled against.
+        const std::string clientHash = __hyprland_api_get_client_hash();
+        if (compositorHash != clientHash)
+            throw std::runtime_error(std::format("version mismatch, recompile against the running Hyprland (built={} running={})", clientHash, compositorHash));
+
+        return pluginInit();
+    } catch (const std::exception& e) {
+        HyprlandAPI::addNotification(handle, std::format("[hyprtail] failed to load: {}", e.what()), CHyprColor{1.0f, 0.2f, 0.2f, 1.0f}, 15000);
+        teardown();
+        throw;
+    } catch (...) {
+        HyprlandAPI::addNotification(handle, "[hyprtail] failed to load: unknown exception", CHyprColor{1.0f, 0.2f, 0.2f, 1.0f}, 15000);
+        teardown();
+        throw std::runtime_error("[hyprtail] unknown exception in init");
+    }
+}
+
+APICALL EXPORT void PLUGIN_EXIT() {
+    hyprtail::diag::guard("exit", [] { hyprtail::compat::log(Log::INFO, "unloading after {} renders", s_frames); });
+    s_frames = 0;
+    teardown();
+}
+
+// The headers' own version ("0.1" at the pin, "0.2" on main since ba616caa),
+// which Hyprland requires to equal its own (PluginSystem.cpp:104). hyprpm
+// builds against the running Hyprland's headers, so a build from it always
+// matches; a build against other headers is refused cleanly at load.
+// NOLINTNEXTLINE(modernize-use-string-view): signature fixed by Hyprland's plugin ABI.
+APICALL EXPORT std::string PLUGIN_API_VERSION() {
+    return HYPRLAND_API_VERSION;
+}

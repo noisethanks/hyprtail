@@ -1,0 +1,161 @@
+name: Smoke
+
+# hyprtail's lifecycle smoke test (tests/hyprtester/hyprtail_smoke.cpp: load,
+# duplicate refusal, hotplug, unload/reload, crash-loop guard) in a NixOS VM,
+# against the pinned Hyprland (smoke-pin) and Hyprland main (smoke-main). Never
+# required. Run it by hand before a release; the weekly run keeps it from
+# rotting unnoticed, and smoke-main catches what upstream.yml's compile rows
+# can't: hook, render-stage and render-context changes that only show at run
+# time. A cold cache builds Hyprland more than once, hence the long timeout.
+on:
+  schedule:
+    - cron: "41 6 * * 0"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: smoke
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    name: smoke-${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Same pin as ci.yml's NIX_PIN; move them together.
+          - name: pin
+            overrides: >-
+              --override-input hyprland github:hyprwm/Hyprland?ref=v0.56.2
+              --override-input hyprland/nixpkgs github:NixOS/nixpkgs/61b7c44c4073f0b827768aff0049561b5110ea5a
+              --no-write-lock-file
+          # main brings its own lock: no nixpkgs override.
+          - name: main
+            overrides: >-
+              --override-input hyprland github:hyprwm/Hyprland?ref=main
+              --no-write-lock-file
+    steps:
+      - uses: actions/checkout@v4
+
+      # The VM is a QEMU guest. Without /dev/kvm it boots under software
+      # emulation and hits the timeout with no error saying why.
+      - name: Enable KVM
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::/dev/kvm is missing on this runner"
+            exit 1
+          fi
+
+      - id: nix
+        uses: ./.github/actions/nix-setup
+        with:
+          cache-key-suffix: smoke-${{ matrix.name }}
+
+      # 10 minutes under the job's, so the cache save below still runs.
+      - name: Build and run the smoke VM
+        timeout-minutes: 140
+        env:
+          OVERRIDES: ${{ matrix.overrides }}
+        run: |
+          set -euo pipefail
+          read -ra ov <<<"$OVERRIDES"
+          nix build ".#legacyPackages.x86_64-linux.smoke" -L "${ov[@]}"
+
+      # The VM test succeeds once the machine ran, so logs come out either
+      # way (nix/smoke.nix); hyprtester's status is in a file.
+      - name: Check exit status
+        run: |
+          set -euo pipefail
+          status="$(cat result/exit_status)"
+          echo "hyprtester exit status: ${status}"
+          [ "${status}" = 0 ]
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-logs-${{ matrix.name }}
+          path: result
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # Even on timeout or failure: finished derivations are in the store.
+      - name: Save Nix store
+        if: always()
+        uses: nix-community/cache-nix-action/save@v7
+        with:
+          primary-key: ${{ steps.nix.outputs.cache-key }}
+          gc-max-store-size-linux: 5G
+
+  # ------------------------------------------------------------------ alert
+  # Scheduled runs only, smoke-main only, like upstream.yml's main row: one
+  # open tracking issue under the upstream-main label, a comment only when
+  # the failure changes. A timed-out or cancelled smoke-main alerts too.
+  # smoke-pin stays silent here, as before.
+  alert:
+    if: always() && github.event_name == 'schedule'
+    needs: [smoke]
+    name: alert
+    runs-on: ubuntu-24.04
+    permissions:
+      issues: write
+      actions: read
+    steps:
+      - name: Open or update the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # Neither upstream.yml title may contain all the words of this one,
+          # or the other way round: the issue search matches title words.
+          title="Hyprland main: hyprtail smoke red"
+          label="upstream-main"
+
+          failed="$(gh api "repos/${REPO}/actions/runs/${{ github.run_id }}/jobs" --paginate \
+            --jq '.jobs[] | select(.name == "smoke-main")
+                  | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled")
+                  | "\(.name) (\(.conclusion))"' | sort)"
+          if [ -z "$failed" ]; then
+            echo "no failures"
+            exit 0
+          fi
+          marker="<!-- failed: $(tr '\n' ' ' <<<"$failed") -->"
+
+          {
+            echo "Scheduled run: ${RUN_URL}"
+            echo
+            echo "Failing:"
+            sed 's/^/- /' <<<"$failed"
+            echo
+            echo "Hyprland ref: main at run time. Logs: the smoke-logs-main artifact of the run."
+            echo
+            echo "$marker"
+          } > body.md
+
+          gh label create "$label" --repo "$REPO" --force --color fbca04 \
+            --description "Scheduled CI against Hyprland main failed" || true
+          issue="$(gh issue list --repo "$REPO" --state open --search "\"$title\" in:title" \
+            --json number --jq '.[0].number // empty')"
+          if [ -z "$issue" ]; then
+            gh issue create --repo "$REPO" --title "$title" --label "$label" --body-file body.md \
+              || gh issue create --repo "$REPO" --title "$title" --body-file body.md
+            exit 0
+          fi
+          last="$(gh issue view "$issue" --repo "$REPO" --json body,comments \
+            --jq '([.body] + [.comments[].body]) | last')"
+          if grep -qF "$marker" <<<"$last"; then
+            echo "issue #$issue already reports this set of failures"
+            exit 0
+          fi
+          gh issue comment "$issue" --repo "$REPO" --body-file body.md

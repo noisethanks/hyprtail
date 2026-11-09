@@ -1,0 +1,362 @@
+#include "LayerPassElement.hpp"
+
+#include <cstddef>
+#include <format>
+
+#include <render/Renderer.hpp>
+#include <render/OpenGL.hpp>
+#include <output/Monitor.hpp>
+
+#include "compat.hpp"
+#include "Diagnostics.hpp"
+
+using hyprtail::diag::eSeverity;
+using namespace Render::GL;
+
+// ---------------------------------------------------------------- node buffer
+
+static constexpr GLsizei NODE_STRIDE = sizeof(SGpuNode);
+
+// Attribute setup for the bound VAO and array buffer. byteOffset is where the
+// field of the first instance's node starts in the VBO. Floats go through
+// glVertexAttribPointer, the bits word through glVertexAttribIPointer
+// (GLES 3.0), which the shader reads as uint without conversion.
+static void attribFloats(GLuint loc, GLint components, size_t byteOffset, GLuint divisor) {
+    glEnableVertexAttribArray(loc);
+    glVertexAttribPointer(loc, components, GL_FLOAT, GL_FALSE, NODE_STRIDE, reinterpret_cast<void*>(byteOffset));
+    glVertexAttribDivisor(loc, divisor);
+}
+
+static void attribBits(GLuint loc, size_t byteOffset, GLuint divisor) {
+    glEnableVertexAttribArray(loc);
+    glVertexAttribIPointer(loc, 1, GL_UNSIGNED_INT, NODE_STRIDE, reinterpret_cast<void*>(byteOffset));
+    glVertexAttribDivisor(loc, divisor);
+}
+
+bool CNodeBuffer::ensure(size_t ringCapacity, std::string& error) {
+    if (m_vao && m_vboNodes == ringCapacity + 2)
+        return true;
+
+    // Capacity changed (config reload): reallocate.
+    if (m_vao)
+        destroy();
+
+    // Front and back pad, see header.
+    m_vboNodes = ringCapacity + 2;
+
+    glGenVertexArrays(1, &m_vao);
+    glGenVertexArrays(1, &m_instVao);
+    glGenBuffers(1, &m_vbo);
+    if (!m_vao || !m_instVao || !m_vbo) {
+        error = std::format("glGenVertexArrays/glGenBuffers returned no name (vao={}, instanced vao={}, vbo={})", m_vao, m_instVao, m_vbo);
+        destroy();
+        return false;
+    }
+
+    // Drain stale errors so the check after glBufferData is ours. This hides
+    // errors core left behind; only core's debug builds look at those.
+    // Bounded: GL keeps one flag per error kind, so a few reads empty it, but
+    // a driver that keeps reporting an error (e.g. a lost context) would
+    // otherwise spin here forever.
+    for (int i = 0; i < 16 && glGetError() != GL_NO_ERROR; ++i) {}
+
+    glBindVertexArray(m_vao);
+    // Through compat: main caches the array-buffer binding (OpenGL.cpp:2455),
+    // the pin doesn't and core binds raw there (OpenGL.cpp:1547, Shader.cpp:236).
+    hyprtail::compat::bindArrayBuffer(m_vbo);
+    glBufferData(GL_ARRAY_BUFFER, m_vboNodes * NODE_STRIDE, nullptr, GL_DYNAMIC_DRAW);
+    if (const GLenum err = glGetError(); err != GL_NO_ERROR) {
+        glBindVertexArray(0);
+        hyprtail::compat::bindArrayBuffer(0);
+        error = std::format("glBufferData for {} bytes failed, GL error 0x{:x}", m_vboNodes * NODE_STRIDE, err);
+        destroy();
+        return false;
+    }
+
+    // One per-instance attribute (divisor 1): a field of the node
+    // `nodeOffset` nodes into the VBO.
+    const auto floats = [](GLuint loc, GLint components, size_t nodeOffset, size_t fieldOffset) { attribFloats(loc, components, nodeOffset * NODE_STRIDE + fieldOffset, 1); };
+    const auto bits   = [](GLuint loc, size_t nodeOffset) { attribBits(loc, nodeOffset * NODE_STRIDE + offsetof(SGpuNode, bits), 1); };
+
+    // prev = n(i-1), p0 = n(i), p1 = n(i+1), next = n(i+2); see header.
+    floats(0, 2, 0, offsetof(SGpuNode, posPx));
+    bits(1, 0);
+    for (GLuint end = 0; end < 2; ++end) {
+        const GLuint loc = 2 + end * 5;
+        floats(loc + 0, 2, 1 + end, offsetof(SGpuNode, posPx));
+        floats(loc + 1, 1, 1 + end, offsetof(SGpuNode, birthMs));
+        floats(loc + 2, 2, 1 + end, offsetof(SGpuNode, velocity));
+        floats(loc + 3, 1, 1 + end, offsetof(SGpuNode, distPx));
+        bits(loc + 4, 1 + end);
+    }
+    floats(12, 2, 3, offsetof(SGpuNode, posPx));
+    bits(13, 3);
+
+    // The instanced VAO: the same VBO, five attributes enabled here; their
+    // pointers and divisor are set before every draw (pointInstanced).
+    glBindVertexArray(m_instVao);
+    for (GLuint loc = 0; loc < 5; ++loc)
+        glEnableVertexAttribArray(loc);
+
+    glBindVertexArray(0);
+    hyprtail::compat::bindArrayBuffer(0);
+
+    m_uploadedGen = UINT64_MAX;
+    return true;
+}
+
+void CNodeBuffer::pointInstanced(size_t firstNode, GLuint copies) {
+    // The front pad is VBO node 0, ring node 0 is VBO node 1.
+    const size_t base = (firstNode + 1) * NODE_STRIDE;
+
+    glBindVertexArray(m_instVao);
+    // The pointer captures the current array-buffer binding, see ensure().
+    hyprtail::compat::bindArrayBuffer(m_vbo);
+    attribFloats(0, 2, base + offsetof(SGpuNode, posPx), copies);
+    attribFloats(1, 1, base + offsetof(SGpuNode, birthMs), copies);
+    attribFloats(2, 2, base + offsetof(SGpuNode, velocity), copies);
+    attribFloats(3, 1, base + offsetof(SGpuNode, distPx), copies);
+    attribBits(4, base + offsetof(SGpuNode, bits), copies);
+    hyprtail::compat::bindArrayBuffer(0);
+}
+
+void CNodeBuffer::upload(const ISource& src) {
+    if (!m_vbo || !sourceNeedsUpload(src, m_uploadedGen))
+        return;
+
+    // Rebase on the newest node: every uploaded birthMs is <= 0 and small, so
+    // float keeps sub-ms precision regardless of how long the plugin has run.
+    m_refMs = src.newestBirthMs();
+    src.orderedCopy(m_ordered, m_refMs);
+
+    // Pads, see header: front = n0 as a segment start, back = newest.
+    SGpuNode front = m_ordered.front();
+    front.bits |= GPU_BIT_SEGMENT_START;
+    m_ordered.insert(m_ordered.begin(), front);
+    m_ordered.push_back(m_ordered.back());
+
+    const size_t n = std::min(m_ordered.size(), m_vboNodes);
+
+    hyprtail::compat::bindArrayBuffer(m_vbo);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, n * NODE_STRIDE, m_ordered.data());
+    hyprtail::compat::bindArrayBuffer(0);
+
+    m_uploadedGen = src.generation();
+}
+
+void CNodeBuffer::destroy() {
+    hyprtail::compat::bindArrayBuffer(0);
+
+    if (m_vao)
+        glDeleteVertexArrays(1, &m_vao);
+    if (m_instVao)
+        glDeleteVertexArrays(1, &m_instVao);
+    if (m_vbo)
+        glDeleteBuffers(1, &m_vbo);
+
+    m_vao         = 0;
+    m_instVao     = 0;
+    m_vbo         = 0;
+    m_vboNodes    = 0;
+    m_uploadedGen = UINT64_MAX;
+    m_refMs       = 0.0;
+    m_ordered.clear();
+}
+
+void CNodeBuffer::invalidate() {
+    m_uploadedGen = UINT64_MAX;
+}
+
+GLuint CNodeBuffer::vao() const {
+    return m_vao;
+}
+
+GLuint CNodeBuffer::instancedVao() const {
+    return m_instVao;
+}
+
+double CNodeBuffer::refMs() const {
+    return m_refMs;
+}
+
+std::span<const SGpuNode> CNodeBuffer::nodes() const {
+    if (m_ordered.size() < 2)
+        return {};
+    return {m_ordered.data() + 1, m_ordered.size() - 2};
+}
+
+// ---------------------------------------------------------------- trail
+
+Vector2D quadAnchor(const STrail& trail) {
+    if (const auto a = trail.warpPlayback.anchor())
+        return {a->x, a->y};
+    return trail.lastPos;
+}
+
+float layerExtentPx(const hyprtail::CLayer& layer) {
+    return layer.res.paddingPx + layer.res.damagePaddingPx;
+}
+
+void trailReleaseGpu(STrail& trail) {
+    trail.gpu.destroy();
+    if (trail.quadVao) {
+        glDeleteVertexArrays(1, &trail.quadVao);
+        trail.quadVao = 0;
+    }
+    for (auto& l : trail.layers)
+        l->slot.release();
+}
+
+// ---------------------------------------------------------------- pass element
+
+CLayerPassElement::CLayerPassElement(STrail* trail, std::vector<SLayerDraw> draws, double nowMs) : m_trail(trail), m_draws(std::move(draws)), m_nowMs(nowMs) {}
+
+std::optional<CBox> CLayerPassElement::boundingBoxWith(hyprtail::compat::RenderCtx& /*ctx*/) {
+    if (m_draws.empty())
+        return std::nullopt;
+    double x1 = m_draws.front().boxLocal.x, y1 = m_draws.front().boxLocal.y;
+    double x2 = x1 + m_draws.front().boxLocal.w, y2 = y1 + m_draws.front().boxLocal.h;
+    for (const auto& d : m_draws) {
+        x1 = std::min(x1, d.boxLocal.x);
+        y1 = std::min(y1, d.boxLocal.y);
+        x2 = std::max(x2, d.boxLocal.x + d.boxLocal.w);
+        y2 = std::max(y2, d.boxLocal.y + d.boxLocal.h);
+    }
+    return CBox{x1, y1, x2 - x1, y2 - y1};
+}
+
+std::vector<UP<IPassElement>> CLayerPassElement::drawWith(hyprtail::compat::RenderCtx& ctx) {
+    // Called from the pass render inside Hyprland: nothing may escape. Each
+    // layer is guarded on its own: one failing doesn't take the others down.
+    for (const auto& d : m_draws) {
+        const bool ok = hyprtail::diag::guard(std::format("draw-{}", d.layer->name()), [&] { drawLayer(ctx, d); });
+        if (!ok) {
+            d.layer->disabled = true;
+            d.layer->slot.release(); // GL is current here
+        }
+    }
+    return {};
+}
+
+void CLayerPassElement::drawLayer(hyprtail::compat::RenderCtx& ctx, const SLayerDraw& d) {
+    auto&      rd      = hyprtail::compat::renderData(ctx);
+    const auto monitor = rd.pMonitor.lock();
+    auto&      layer   = *d.layer;
+    auto&      trail   = *m_trail;
+    if (!monitor || layer.disabled || !layer.resolved())
+        return;
+
+    using hyprtail::shader::eTopology;
+    const auto topology  = layer.topology();
+    const bool path      = topology == eTopology::PATH;
+    const bool instanced = topology == eTopology::INSTANCED;
+
+    GLuint     vao   = 0;
+    GLsizei    count = 1;
+    // Instanced: the visible nodes (the newest ones) from ring node first,
+    // K copies of each.
+    size_t first   = 0;
+    size_t visible = 0;
+    GLuint copies  = 1;
+    if (path || instanced) {
+        const auto& source = *trail.source;
+        if (trail.gpuFailed || source.size() < (path ? 2u : 1u))
+            return;
+        if (std::string error; !trail.gpu.ensure(source.capacity(), error)) {
+            trail.gpuFailed = true;
+            hyprtail::diag::report(eSeverity::ERR, "gl:nodes", std::format("path and instanced layers disabled: GL resource creation failed: {}", error));
+            return;
+        }
+        trail.gpu.upload(source);
+
+        if (path) {
+            vao   = trail.gpu.vao();
+            count = static_cast<GLsizei>(source.size() - 1); // one instance per segment
+        } else {
+            // The same count the damage box was computed from (main.cpp),
+            // drawn in runs that leave out nodes alone in their segment.
+            visible   = source.visibleCount(m_nowMs, layer.res.fadeMs);
+            first     = source.size() - visible;
+            bool none = true;
+            forEachInstancedRun(trail.gpu.nodes(), first, visible, [&none](size_t, size_t) { none = false; });
+            if (none)
+                return;
+            copies = static_cast<GLuint>(std::max(layer.res.instances, 1));
+            vao    = trail.gpu.instancedVao();
+        }
+    } else {
+        if (!trail.quadVao)
+            glGenVertexArrays(1, &trail.quadVao);
+        if (!trail.quadVao) {
+            layer.disabled = true;
+            hyprtail::diag::report(eSeverity::ERR, "gl:" + layer.name(), std::format("layer {} disabled: glGenVertexArrays returned no name", layer.name()));
+            return;
+        }
+        vao = trail.quadVao;
+    }
+
+    auto& slot = layer.slot;
+
+    // Through Hyprland's program cache (OpenGL.cpp:2561-2569), not raw
+    // glUseProgram. Our uniforms aren't core's eShaderUniform ones, so they
+    // are set raw on the program's own locations.
+    g_pHyprOpenGL->useShader(slot.shader());
+
+    const auto proj = hyprtail::globalProjection(ctx, monitor).getMatrix();
+    glUniformMatrix3fv(slot.loc("ht_proj"), 1, GL_TRUE, proj.data());
+    glUniform1f(slot.loc("ht_nowMs"), static_cast<float>(m_nowMs - trail.gpu.refMs()));
+    glUniform1f(slot.loc("ht_stillMs"), static_cast<float>(m_nowMs - trail.lastMotionMs));
+    const Vector2D anchor = quadAnchor(trail);
+    glUniform2f(slot.loc("ht_anchor"), static_cast<float>(anchor.x), static_cast<float>(anchor.y));
+    glUniform1f(slot.loc("ht_extentPx"), d.extentPx);
+    // The scale globalProjection() builds into ht_proj (RenderUtil.cpp).
+    glUniform1f(slot.loc("ht_scale"), monitor->m_scale);
+    glUniform1f(slot.loc("fade_ms"), static_cast<float>(layer.res.fadeMs));
+    glUniform1f(slot.loc("start_ms"), static_cast<float>(layer.res.startMs));
+    glUniform1f(slot.loc("duration_ms"), static_cast<float>(layer.res.durationMs));
+    if (instanced)
+        glUniform1i(slot.loc("ht_K"), std::max(layer.res.instances, 1));
+
+    using hyprtail::params::eType;
+    for (const auto& [decl, v] : layer.res.values) {
+        const GLint loc = slot.loc(decl.name);
+        if (loc < 0)
+            continue;
+        switch (decl.type) {
+            case eType::FLOAT: glUniform1f(loc, static_cast<float>(v.x)); break;
+            case eType::INT:
+            case eType::BOOL: glUniform1i(loc, static_cast<GLint>(v.x)); break;
+            case eType::VEC2: glUniform2f(loc, static_cast<float>(v.x), static_cast<float>(v.y)); break;
+            // Color management like core's solid colors (RenderUtil).
+            case eType::COLOR: hyprtail::setPaletteUniform(ctx, loc, CHyprColor{static_cast<uint64_t>(v.argb)}); break;
+        }
+    }
+
+    // Premultiplied blending through Hyprland's cap-status cache
+    // (OpenGL.cpp:981-989). Blend state is whatever the previous element
+    // left, so set it explicitly.
+    g_pHyprOpenGL->blend(true);
+
+    glBindVertexArray(vao);
+
+    // Clip to this element's damage, same pattern as core (OpenGL.cpp:1117-1124).
+    // Scissor through Hyprland's cached state, not raw glEnable/glScissor.
+    const auto nodes = trail.gpu.nodes();
+    rd.damage.forEachRect([&](const auto& RECT) {
+        hyprtail::compat::scissor(ctx, &RECT, rd.transformDamage);
+        if (path)
+            glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, count);
+        else if (instanced) {
+            // pointInstanced() binds the instanced VAO (already bound) and
+            // re-points its attributes at the run.
+            forEachInstancedRun(nodes, first, visible, [&](size_t from, size_t n) {
+                trail.gpu.pointInstanced(from, copies);
+                glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, static_cast<GLsizei>(n * copies));
+            });
+        } else
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    });
+
+    hyprtail::compat::scissor(ctx, nullptr, true);
+    glBindVertexArray(0);
+}

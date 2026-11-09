@@ -1,0 +1,149 @@
+name: CI
+
+# The PR gate: "did this change break hyprtail?", against the pinned Hyprland
+# only (the Makefile's HYPRLAND_PIN), so the answer never moves under a PR. Whether
+# upstream Hyprland broke hyprtail is upstream.yml's question, not this one.
+#
+# No `paths:` filter: a required check that a filter skips never reports, and
+# blocks every merge.
+on:
+  pull_request:
+    branches: [master]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# The pin, in the two forms the jobs need. Move both together with the
+# Makefile's HYPRLAND_PIN (the comment there lists every place the pin lives).
+env:
+  # Arch Linux Archive date whose repos carry the pinned Hyprland package
+  # (hyprland 0.56.2-4, first present on 2026/10/03).
+  ARCH_SNAPSHOT: "2026/10/03"
+  # The flake's `hyprland` input at the pinned tag, plus the nixpkgs that
+  # v0.56.1's flake.lock uses (glaze 7.9.0): v0.56.2's own lock ships glaze
+  # 8.0.0, which its CMakeLists.txt:133 (`glaze 7...<8`) rejects.
+  # Drop the nixpkgs override once a pinned tag builds without it.
+  NIX_PIN: >-
+    --override-input hyprland github:hyprwm/Hyprland?ref=v0.56.2
+    --override-input hyprland/nixpkgs github:NixOS/nixpkgs/61b7c44c4073f0b827768aff0049561b5110ea5a
+    --no-write-lock-file
+
+# ubuntu-24.04, not ubuntu-latest: that moves to Ubuntu 26.04 in late 2026,
+# whose RAM-backed /tmp may be too small for a Hyprland build or the VM test.
+jobs:
+  # ------------------------------------------------------------------- arch
+  # The hyprpm path: Arch's packaged (LTO) Hyprland at the pin, `make all`,
+  # host-free tests, nm import check against the real binary, formatting.
+  arch:
+    name: arch-pin
+    runs-on: ubuntu-24.04
+    container:
+      image: archlinux:latest
+      # LeakSanitizer (test-unit SANITIZE=1) stops threads with ptrace.
+      options: --cap-add=SYS_PTRACE
+    steps:
+      # Before checkout, so checkout finds git and makes a real clone (the
+      # Makefile's rev header reads it). -Syyuu moves every package to the
+      # snapshot, downgrading the image where it is newer.
+      - name: Install packages from the pinned snapshot
+        run: |
+          set -euo pipefail
+          echo 'Server = https://archive.archlinux.org/repos/${{ env.ARCH_SNAPSHOT }}/$repo/os/$arch' > /etc/pacman.d/mirrorlist
+          pacman -Syyuu --noconfirm --needed base-devel git hyprland glslang clang
+
+      - uses: actions/checkout@v4
+
+      - name: make check-ascii
+        run: make check-ascii
+
+      # The snapshot must carry the Makefile's HYPRLAND_PIN. Without this, a
+      # re-pin that misses ARCH_SNAPSHOT tests another Hyprland and passes,
+      # with only check-headers' warning in the log.
+      - name: Snapshot Hyprland is the pin
+        run: make check-headers STRICT_PIN=1
+
+      - name: Build and test (scripts/ci/arch.sh)
+        run: bash scripts/ci/arch.sh
+
+      # clang-format comes from the same snapshot, so its version only moves
+      # with a re-pin. Same file list as `make format`.
+      - name: clang-format
+        if: success() || failure()
+        run: make check-format
+
+  # -------------------------------------------------------------------- nix
+  # The two ways a Nix user installs hyprtail, at the pin: the flake's own
+  # package (`nix flake check` builds `checks`: the package and the host-free
+  # tests) and `overlays.default` applied by a downstream flake (nix/consumer).
+  nix:
+    name: nix-pin
+    runs-on: ubuntu-24.04
+    steps:
+      # Full history: `nix build ./nix/consumer` locks this checkout as a
+      # git+file flake and needs its revCount, which Nix refuses on a shallow
+      # clone.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: nix
+        uses: ./.github/actions/nix-setup
+        with:
+          cache-key-suffix: pin
+
+      - name: nix flake check
+        run: |
+          set -euo pipefail
+          read -ra pin <<<"$NIX_PIN"
+          nix flake check -L "${pin[@]}"
+
+      # Evaluates the aarch64 outputs too; only x86_64 is built above.
+      - name: nix flake check --all-systems (evaluation only)
+        run: |
+          set -euo pipefail
+          read -ra pin <<<"$NIX_PIN"
+          nix flake check --all-systems --no-build "${pin[@]}"
+
+      - name: Build through overlays.default (nix/consumer)
+        run: |
+          set -euo pipefail
+          read -ra pin <<<"$NIX_PIN"
+          nix build ./nix/consumer -L "${pin[@]}" \
+            --override-input hyprtail "git+file://$GITHUB_WORKSPACE"
+
+      - name: Save Nix store
+        if: success()
+        uses: nix-community/cache-nix-action/save@v7
+        with:
+          primary-key: ${{ steps.nix.outputs.cache-key }}
+          gc-max-store-size-linux: 5G
+
+  # ------------------------------------------------------------------- gate
+  # The single required check. GitHub counts a skipped required job as
+  # passing; this job always runs and fails unless every gated job really
+  # succeeded. Gate a new job by adding it to `needs` and the loop below.
+  ci-gate:
+    name: ci-gate
+    if: always()
+    needs: [arch, nix]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every gated job to succeed
+        env:
+          ARCH: ${{ needs.arch.result }}
+          NIX: ${{ needs.nix.result }}
+        run: |
+          set -euo pipefail
+          fail=0
+          for pair in "arch-pin=$ARCH" "nix-pin=$NIX"; do
+            if [ "${pair#*=}" != "success" ]; then
+              echo "::error::${pair%%=*} result is '${pair#*=}', not 'success'"
+              fail=1
+            fi
+          done
+          exit "$fail"

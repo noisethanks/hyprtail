@@ -1,0 +1,383 @@
+PLUGIN_NAME := hyprtail
+
+SOURCE_FILES := $(wildcard src/*.cpp)
+HEADER_FILES := $(wildcard src/*.hpp)
+# Embedded into the plugin with #embed (src/ShaderSource.cpp).
+SHADER_FILES := $(wildcard hyprtail/shaders/*.vert hyprtail/shaders/*.frag hyprtail/shaders/*/*.glsl)
+# Embedded built-in preset manifests, #embed (src/Manifest.cpp).
+PRESET_FILES := $(wildcard hyprtail/presets/*.conf)
+
+# Which Hyprland checkout DEV=1 builds against (default: the pin).
+#   make DEV=1 HYPRLAND_DIR=external/Hyprland-main
+# Build products go to OUT, out/<checkout name> for any checkout but the pin,
+# so builds against different checkouts coexist. Only `make clean` removes
+# them all.
+DEV ?= 0
+
+PINNED_DIR := $(abspath external/Hyprland)
+ifneq ($(origin HYPRLAND_DIR),undefined)
+    ifneq ($(DEV),1)
+        $(error HYPRLAND_DIR only applies to DEV=1 builds; the default build takes its headers from pkg-config)
+    endif
+endif
+HYPRLAND_DIR ?= external/Hyprland
+HYPRLAND_SRC := $(abspath $(HYPRLAND_DIR))
+ifeq ($(HYPRLAND_SRC),$(PINNED_DIR))
+    OUT ?= out
+else
+    OUT ?= out/$(notdir $(HYPRLAND_SRC))
+endif
+
+OBJECT_FILES := $(patsubst src/%.cpp, $(OUT)/%.o, $(SOURCE_FILES))
+
+OUTPUT := $(OUT)/$(PLUGIN_NAME).so
+
+# Two ways to get Hyprland's headers:
+#
+#   make          Default, used by hyprpm and users. Headers from pkg-config.
+#                 Under hyprpm, PKG_CONFIG_PATH points at the headers hyprpm
+#                 built for the running Hyprland; otherwise the installed
+#                 package's (e.g. /usr/include/hyprland).
+#   make DEV=1    Development. Headers from the external/Hyprland checkout,
+#                 which must be at the pinned commit and built, or
+#                 from another built checkout given as HYPRLAND_DIR (above).
+
+# Pinned Hyprland commit. Tracks the host package: v0.56.2. Hyprland has no ABI
+# stability across commits, so advance the pin deliberately: rebuild
+# external/Hyprland, run `make test-unit` and `make smoke`, then move every copy
+# of the pin together, in one PR: this variable, flake.nix's hyprland.url (then
+# `nix flake lock`), ARCH_SNAPSHOT and NIX_PIN in ci.yml, the pin row in smoke.yml,
+# and pin_tag/pin_nixpkgs in upstream.yml.
+HYPRLAND_PIN   := efb50993780079460b0cbed1363e2166a2de1d9f
+HOST_VERSION_H := /usr/include/hyprland/src/version.h
+
+ifeq ($(DEV),1)
+    HEADER_CHECK    := check-pin
+    # pkg-config brings in the pixman/drm/cairo/freetype includes that
+    # hyprland.pc would otherwise provide.
+    HYPRLAND_CFLAGS := -I$(HYPRLAND_SRC)/src -I$(HYPRLAND_SRC)/protocols $(shell pkg-config --cflags pixman-1 libdrm cairo freetype2)
+else
+    HEADER_CHECK    := check-headers
+    HYPRLAND_CFLAGS := $(shell pkg-config --cflags hyprland 2>/dev/null)
+endif
+
+# Appended, not assigned: hyprpm passes extra CFLAGS/CXXFLAGS through the
+# environment (hyprpm PluginManager.cpp getPluginBuildEnv).
+CXXFLAGS += -Wall -Wno-missing-field-initializers -fPIC -std=c++26 -g $(HYPRLAND_CFLAGS)
+
+# GCC marks some template statics STB_GNU_UNIQUE, which makes dlclose a no-op
+# and breaks plugin unload/reload. Checked by compiler identity, not by name,
+# so CXX=c++ still gets it.
+ifneq ($(shell $(CXX) --version 2>/dev/null | grep -c "Free Software Foundation"),0)
+    CXXFLAGS += --no-gnu-unique
+endif
+
+# Build revision, shown in the "loaded" notification, the log and the
+# errors.log header, so it's clear which build a running Hyprland has loaded
+# (hyprpm doesn't reload an already-loaded plugin after `hyprpm update`).
+# Rewritten only when it changes, so it doesn't force rebuilds. The
+# environment's HYPRTAIL_REV wins over git: the Nix sandbox has no .git, so the
+# flake passes the revision it was built from (flake.nix).
+REV_HEADER := $(OUT)/rev.hpp
+CXXFLAGS   += -I$(OUT)
+
+# Release version, from the VERSION file (also read by flake.nix). main.cpp
+# reports it as the plugin's version.
+HYPRTAIL_VERSION := $(strip $(file < VERSION))
+CXXFLAGS         += -DHYPRTAIL_VERSION='"$(HYPRTAIL_VERSION)"'
+
+# DEV value out/ was built with, see its rule.
+BUILD_MODE := $(OUT)/build-mode
+
+.PHONY: all clean load unload smoke test-unit test-compat format check-format lint check-pin check-headers check-log check-render-context check-ascii readme-presets check-readme preset-docs check-preset-docs install-hooks FORCE
+
+all: $(OUTPUT)
+
+$(OUTPUT): $(OBJECT_FILES)
+	$(CXX) -shared $^ $(LDFLAGS) -o $@
+
+$(OUT)/%.o: src/%.cpp $(HEADER_FILES) $(SHADER_FILES) $(PRESET_FILES) $(BUILD_MODE) | $(HEADER_CHECK) check-log check-render-context
+	@mkdir -p $(OUT)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# Which headers $(OUT) was built against. Switching between `make` and
+# `make DEV=1` rebuilds everything instead of linking objects built against
+# the other headers. Rewritten only when it changes.
+$(BUILD_MODE): FORCE
+	@mkdir -p $(OUT)
+	@echo "DEV=$(DEV) $(if $(filter 1,$(DEV)),DIR=$(HYPRLAND_SRC))" > $@.tmp; \
+	if cmp -s $@.tmp $@; then rm -f $@.tmp; else mv $@.tmp $@; fi
+
+$(OUT)/main.o $(OUT)/Diagnostics.o: $(REV_HEADER)
+$(OUT)/main.o: VERSION
+
+$(REV_HEADER): FORCE
+	@mkdir -p $(OUT)
+	@rev="$$HYPRTAIL_REV"; \
+	if [ -z "$$rev" ]; then \
+		rev="$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"; \
+		if [ "$$rev" != unknown ] && ! git diff --quiet HEAD -- 2>/dev/null; then rev="$$rev-dirty"; fi; \
+	fi; \
+	case "$$rev" in *[!A-Za-z0-9._-]*) echo "error: HYPRTAIL_REV '$$rev' has characters outside [A-Za-z0-9._-]" >&2; exit 1;; esac; \
+	printf '#pragma once\n#define HYPRTAIL_REV "%s"\n' "$$rev" > $@.tmp; \
+	if cmp -s $@.tmp $@; then rm -f $@.tmp; else mv $@.tmp $@; fi
+
+# Default mode: fail clearly if pkg-config can't find Hyprland's headers, and
+# warn (don't fail) if they're not the commit this plugin is developed
+# against: it may still build and work, or not (no ABI stability across
+# Hyprland commits). STRICT_PIN=1 makes a mismatch, or headers without a
+# version.h to compare, an error (ci.yml arch-pin).
+check-headers:
+	@if ! pkg-config --exists hyprland; then \
+		echo "error: Hyprland headers not found by pkg-config (hyprland.pc)." >&2; \
+		echo "       Install your distribution's Hyprland development headers, build with hyprpm, or use 'make DEV=1'." >&2; \
+		exit 1; \
+	fi
+	@api=""; \
+	for d in $$(pkg-config --cflags-only-I hyprland | sed 's/-I//g'); do \
+		if [ -f "$$d/plugins/PluginAPI.hpp" ]; then api=1; break; fi; \
+	done; \
+	if [ -z "$$api" ]; then \
+		echo "error: <plugins/PluginAPI.hpp> is not under any -I from 'pkg-config --cflags hyprland'." >&2; \
+		echo "       hyprland.pc before Hyprland v0.55.0 has no -I<prefix>/hyprland/src, which hyprtail's" >&2; \
+		echo "       includes need. hyprtail needs Hyprland 0.56 or newer (developed against v0.56.2)." >&2; \
+		echo "       Otherwise the development headers are incomplete: reinstall them or use 'make DEV=1'." >&2; \
+		exit 1; \
+	fi
+	@found=""; api=""; \
+	for d in $$(pkg-config --cflags-only-I hyprland | sed 's/-I//g'); do \
+		if [ -z "$$found" ] && [ -f "$$d/version.h" ]; then found=$$(sed -n 's/^#define GIT_COMMIT_HASH *"\(.*\)"/\1/p' "$$d/version.h"); fi; \
+		if [ -z "$$api" ] && [ -f "$$d/plugins/PluginAPI.hpp" ]; then api=$$(sed -n 's/^#define HYPRLAND_API_VERSION *"\(.*\)"/\1/p' "$$d/plugins/PluginAPI.hpp"); fi; \
+	done; \
+	if [ "$(STRICT_PIN)" = 1 ] && [ "$$found" != "$(HYPRLAND_PIN)" ]; then \
+		echo "error: Hyprland headers are at '$$found', pin is $(HYPRLAND_PIN) (STRICT_PIN=1)" >&2; exit 1; \
+	fi; \
+	if [ -n "$$found" ] && [ "$$found" != "$(HYPRLAND_PIN)" ]; then \
+		echo "warning: building against Hyprland $$found (plugin API $${api:-unknown}); hyprtail is developed against $(HYPRLAND_PIN) (v0.56.2, plugin API 0.1) and checked nightly against Hyprland main (plugin API 0.2); other versions may not build or work" >&2; \
+	fi
+
+# DEV=1: the checkout must have been built (version.h and the protocol
+# headers are generated by its build). external/Hyprland must also be at the
+# pin, and warns if the installed host headers moved off it, e.g. after a
+# package upgrade: the plugin would then fail the ABI hash check when loaded
+# into the host. Any other checkout (HYPRLAND_DIR) is a compatibility build:
+# it only reports which commit it built against.
+check-pin:
+	@head=$$(git -C $(HYPRLAND_SRC) rev-parse HEAD 2>/dev/null); \
+	if [ "$(HYPRLAND_SRC)" = "$(PINNED_DIR)" ] && [ "$$head" != "$(HYPRLAND_PIN)" ]; then \
+		echo "error: external/Hyprland is at '$$head', pin is $(HYPRLAND_PIN)" >&2; exit 1; \
+	fi; \
+	if [ "$(HYPRLAND_SRC)" != "$(PINNED_DIR)" ]; then \
+		echo "note: building against $(HYPRLAND_SRC) at '$$head', not the pin $(HYPRLAND_PIN)" >&2; \
+	fi
+	@if [ ! -f $(HYPRLAND_SRC)/src/version.h ]; then \
+		echo "error: $(HYPRLAND_SRC)/src/version.h missing, run 'make clear && make debug' in $(HYPRLAND_SRC)" >&2; exit 1; \
+	fi
+	@if [ "$(HYPRLAND_SRC)" = "$(PINNED_DIR)" ] && [ -f $(HOST_VERSION_H) ] && ! grep -q '"$(HYPRLAND_PIN)"' $(HOST_VERSION_H); then \
+		echo "warning: installed Hyprland headers ($(HOST_VERSION_H)) are not at the pin; host package moved? re-pin before loading on the host" >&2; \
+	fi
+
+# Hyprland's own Log::logger->log() must only be called from compat.hpp: on
+# main the same-looking call can compile and print the wrong thing (compat.hpp).
+check-log:
+	@if grep -n 'logger->log(' $(filter-out src/compat.hpp,$(SOURCE_FILES) $(HEADER_FILES)); then \
+		echo "error: call hyprtail::compat::log(), not Log::logger->log() (src/compat.hpp)" >&2; exit 1; \
+	fi
+
+# Per-render state goes through compat.hpp's RenderCtx wrappers. The pin's
+# renderer globals don't exist on main, and IHyprRenderer::context() does but
+# is already reset at RENDER_POST there (compat.hpp). Comment lines are
+# skipped: they cite the pin's code.
+check-render-context:
+	@if grep -nE 'm_renderData|m_renderPass|context\(\)' $(filter-out src/compat.hpp,$(SOURCE_FILES) $(HEADER_FILES)) | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//'; then \
+		echo "error: reach per-render state through hyprtail::compat (renderData, addPassElement, ...) with the RenderCtx a hook or event passed in (src/compat.hpp)" >&2; exit 1; \
+	fi
+
+# Workflow, YAML and Nix files must be pure ASCII: a stray byte (an em dash
+# pasted into a workflow) makes GitHub silently drop the workflow. Allowed:
+# printable ASCII, tab and newline. Anything else, CR included, fails. grep
+# exits 1 for "no match" (pass), 0 for a match and 2 for an error such as a
+# missing path (both fail).
+ASCII_PATHS ?= .github flake.nix nix Makefile
+
+check-ascii:
+	@LC_ALL=C grep -rnP '[^\x09\x0A\x20-\x7E]' $(ASCII_PATHS); rc=$$?; \
+	if [ $$rc -eq 1 ]; then exit 0; fi; \
+	if [ $$rc -eq 0 ]; then echo "error: non-ASCII byte or control character in $(ASCII_PATHS) (lines above)" >&2; fi; \
+	exit 1
+
+# README.md's preset list, between <!-- presets:start --> and
+# <!-- presets:end -->, is generated from each preset's description = line
+# (scripts/readme-presets.sh). `make readme-presets` rewrites it;
+# `make check-readme` fails if it is stale (the pre-push hook runs it).
+readme-presets:
+	@mkdir -p out
+	sh scripts/readme-presets.sh > out/README.md
+	mv out/README.md README.md
+
+check-readme:
+	@sh scripts/readme-presets.sh | diff -u README.md - || { echo "error: README.md preset list is stale, run make readme-presets" >&2; exit 1; }
+
+# Use the hooks shipped in .githooks/ (pre-push runs check-ascii,
+# check-format, check-readme and check-preset-docs).
+install-hooks:
+	git config core.hooksPath .githooks
+
+clean:
+	$(RM) -r out/ $(OUT)
+
+# These talk to whichever Hyprland instance $HYPRLAND_INSTANCE_SIGNATURE
+# points at: run them from a terminal inside the instance you mean.
+load: all
+	hyprctl plugin load $(CURDIR)/$(OUTPUT)
+
+unload:
+	hyprctl plugin unload $(CURDIR)/$(OUTPUT)
+
+# Unit tests for the Hyprland-free parts. The unit binary
+# also compiles and links every hyprtail/shaders/*.vert with every *.frag
+# through glslangValidator (testShaderLinkMatrix; GLSL ES 3.00 syntax and
+# semantics, no GPU) and leaves the preprocessed shaders in $(UNIT_OUT)/glsl
+# for inspection. No compositor involved.
+# `make test-unit SANITIZE=1` builds with AddressSanitizer and UBSan.
+UNIT_OUT := out/unit
+UNIT_FLAGS := $(if $(filter 1,$(SANITIZE)),-O0 -fsanitize=address -fsanitize=undefined,)
+# The spring source calls hyprutils' advanceSpring (SpringChain.cpp), and the
+# warp easing tests run hyprutils' CBezierCurve (the evaluator behind
+# warp_p1/warp_p2): the one Hyprland-family library the unit tests link, for its
+# headers and symbols only.
+HYPRUTILS  := $(shell pkg-config --cflags --libs hyprutils 2>/dev/null || echo -lhyprutils)
+
+# The Hyprland-free sources: what the unit tests and scripts/preset-docs.cpp
+# link.
+HOSTLESS_SOURCES := src/Params.cpp src/ShaderSource.cpp src/Source.cpp src/SpringChain.cpp src/TrailBuffer.cpp src/WarpPath.cpp src/CrashGuard.cpp src/Manifest.cpp src/TrailResolve.cpp src/ShaderPair.cpp src/LayerValues.cpp
+
+test-unit:
+	@mkdir -p $(UNIT_OUT)
+	$(CXX) -std=c++26 -Wall -g $(UNIT_FLAGS) tests/unit/unit.cpp $(HOSTLESS_SOURCES) $(HYPRUTILS) -o $(UNIT_OUT)/unit
+	rm -rf $(UNIT_OUT)/glsl
+	OUT_DIR=$(UNIT_OUT)/glsl $(UNIT_OUT)/unit
+
+# The generated parts of the shipped presets (scripts/preset-docs.cpp): the
+# common block, from PRESET_TEMPLATE, and the trailing comments of the keys a
+# preset's "# doc:" lines name, from the params' pragma docs. `make
+# preset-docs` rewrites them; `make check-preset-docs` fails if any is stale
+# (the pre-push hook runs it). Hand-written trailing comments start "#!".
+PRESET_DOCS     := out/tools/preset-docs
+PRESET_TEMPLATE := scripts/preset-common.txt
+
+$(PRESET_DOCS): scripts/preset-docs.cpp $(HOSTLESS_SOURCES) $(HEADER_FILES) $(SHADER_FILES) $(PRESET_FILES)
+	@mkdir -p $(dir $@)
+	$(CXX) -std=c++26 -Wall -O1 scripts/preset-docs.cpp $(HOSTLESS_SOURCES) $(HYPRUTILS) -o $@
+
+preset-docs: $(PRESET_DOCS)
+	$(PRESET_DOCS) $(PRESET_TEMPLATE) $(PRESET_FILES)
+
+check-preset-docs: $(PRESET_DOCS)
+	@$(PRESET_DOCS) --check $(PRESET_TEMPLATE) $(PRESET_FILES)
+
+# Compile-only check of src/compat.hpp against the selected Hyprland headers
+# (`make test-compat`, `make DEV=1 test-compat [HYPRLAND_DIR=...]`): every
+# wrapper is instantiated and the assumptions it makes are asserted.
+test-compat: | $(HEADER_CHECK)
+	@mkdir -p $(OUT)/compat
+	$(CXX) $(CXXFLAGS) -c tests/compat/compat.cpp -o $(OUT)/compat/compat.o
+
+# Formatting and static analysis (.clang-format, .clang-tidy). Dev-only tools,
+# none of them is needed to build: clang-format, clang-tidy (with
+# run-clang-tidy) and compiledb (`pip install compiledb`, ideally in a venv).
+#
+# `make format` rewrites the sources in place; `make check-format` fails if it
+# would change anything (CI and the pre-push hook run it).
+#
+# `make lint` follows the selected build mode (`make lint`, `make DEV=1 lint
+# [HYPRLAND_DIR=...]`). The compile database comes from a dry run of this
+# Makefile (compiledb -n), so it carries the real flags. It runs with
+# CXX=clang++ whatever CXX is: the gcc-only flags (--no-gnu-unique) would break
+# clang-tidy. Headers are filtered to this repo's: .clang-tidy's
+# HeaderFilterRegex also matches Hyprland's .hpp files. tests/unit/unit.cpp is
+# analysed separately: test-unit compiles it together with eleven sources in one
+# command, which compiledb can't turn into per-file entries (it files the whole
+# command under the last source, replacing that source's real entry).
+FORMAT_FILES := $(wildcard src/*.cpp src/*.hpp tests/*/*.cpp tests/*/*.hpp scripts/*.cpp)
+COMPILEDB    ?= compiledb
+LINT_DB      := $(OUT)/lint
+LINT_HEADERS := ^$(CURDIR)/(src|tests)/
+
+format:
+	@command -v clang-format >/dev/null || { echo "error: clang-format not found" >&2; exit 1; }
+	clang-format -i $(FORMAT_FILES)
+
+check-format:
+	@command -v clang-format >/dev/null || { echo "error: clang-format not found" >&2; exit 1; }
+	clang-format --dry-run -Werror $(FORMAT_FILES)
+
+lint: $(REV_HEADER) | $(HEADER_CHECK)
+	@for t in $(COMPILEDB) clang++ clang-tidy run-clang-tidy; do \
+		command -v $$t >/dev/null || { echo "error: $$t not found (dev-only tool; compiledb: pip install compiledb, or COMPILEDB=/path/to/compiledb)" >&2; exit 1; }; \
+	done
+	@mkdir -p $(LINT_DB)
+	$(COMPILEDB) -n -o $(LINT_DB)/compile_commands.json $(MAKE) -B CXX=clang++ all test-compat
+	@status=0; \
+	run-clang-tidy -p $(LINT_DB) -quiet -header-filter='$(LINT_HEADERS)' '(src|tests)/.*\.cpp$$' || status=1; \
+	clang-tidy -quiet -header-filter='$(LINT_HEADERS)' tests/unit/unit.cpp -- -std=c++26 $$(pkg-config --cflags hyprutils 2>/dev/null) || status=1; \
+	exit $$status
+
+# Lifecycle smoke test: load, duplicate refusal, monitor hotplug,
+# unload and reload of the plugin in a headless Hyprland started from the
+# external/Hyprland checkout, which must be built with tests (`make clear &&
+# make debug` there). Run it at every re-pin, from a terminal in a Wayland
+# session.
+#
+# Environment for the test Hyprland:
+# - Its own XDG_RUNTIME_DIR, so hyprtester (which talks to the newest
+#   instance under $XDG_RUNTIME_DIR/hypr, hyprtester/src/hyprctlCompat.cpp:26-80)
+#   can't reach the running session. Short: the socket path is the runtime
+#   dir plus 82 characters and must fit in 107 (Hyprland Compositor.cpp:192-217,
+#   EventManager.cpp:21-24; HyprCtl.cpp:2331-2333 silently truncates instead).
+# - The session's Wayland socket as an absolute WAYLAND_DISPLAY: at this pin
+#   Hyprland always starts headless + DRM-if-available + Wayland-fallback
+#   (Compositor.cpp:307-319, HYPRLAND_HEADLESS_ONLY isn't read), the headless
+#   backend has no DRM fd, and without an allocator from DRM (unavailable
+#   inside a session) or Wayland, aquamarine's start() fails ("CBackend::create()
+#   failed!", aquamarine Backend.cpp:163-178). libwayland accepts an absolute
+#   WAYLAND_DISPLAY independent of XDG_RUNTIME_DIR (wayland-client.c:1164-1185).
+#   The test Hyprland is a Wayland client of the session: nothing is loaded
+#   into it. Its one Wayland output is disabled by test.lua's catch-all rule.
+# - Scratch XDG_STATE_HOME, so errors.log is the test's own, and scratch
+#   XDG_CONFIG_HOME, where the test copies its fixture trails and shaders
+#   from HYPRTAIL_FIXTURES (tests/hyprtester/fixtures) before loading
+#   (hyprtail reads them from $XDG_CONFIG_HOME/hypr/hyprtail/).
+# The test file and config are copied into the checkout for the build and
+# removed afterwards. On failure the scratch directory (Hyprland log under
+# hypr/, errors.log under state/hyprtail/) is kept and its path printed.
+HYPRTESTER_DIR := $(HYPRLAND_SRC)/hyprtester
+SMOKE_TEST     := $(HYPRTESTER_DIR)/src/tests/main/hyprtail_smoke.cpp
+SMOKE_CONFIG   := $(HYPRTESTER_DIR)/hyprtail_smoke.lua
+
+smoke:
+	$(MAKE) DEV=1 all
+	@if [ ! -x $(HYPRLAND_SRC)/build/Hyprland ] || [ ! -d $(HYPRLAND_SRC)/build/hyprtester ]; then \
+		echo "error: external/Hyprland isn't built with tests; run 'make clear && make debug' in external/Hyprland" >&2; exit 1; \
+	fi
+	@case "$$WAYLAND_DISPLAY" in \
+		"") echo "error: run make smoke inside a Wayland session (WAYLAND_DISPLAY unset); the test Hyprland needs it for a GPU allocator" >&2; exit 1 ;; \
+		/*) wl="$$WAYLAND_DISPLAY" ;; \
+		*) wl="$$XDG_RUNTIME_DIR/$$WAYLAND_DISPLAY" ;; \
+	esac; \
+	if [ ! -S "$$wl" ]; then echo "error: session Wayland socket $$wl not found" >&2; exit 1; fi; \
+	tmp=$$(mktemp -d /tmp/hts.XXXXXX) || exit 1; \
+	if [ $${#tmp} -gt 25 ]; then echo "error: runtime dir $$tmp too long for Hyprland's socket paths" >&2; rm -rf "$$tmp"; exit 1; fi; \
+	trap 'rm -f $(SMOKE_TEST) $(SMOKE_CONFIG)' EXIT; \
+	cp tests/hyprtester/hyprtail_smoke.cpp $(SMOKE_TEST) && \
+	cat $(HYPRTESTER_DIR)/test.lua tests/hyprtester/smoke.lua > $(SMOKE_CONFIG) && \
+	cmake --build $(HYPRLAND_SRC)/build --target hyprtester -j$$(nproc) || exit 1; \
+	mkdir -p "$$tmp/state" || exit 1; \
+	cd $(HYPRLAND_SRC) && env -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE \
+		WAYLAND_DISPLAY="$$wl" XDG_RUNTIME_DIR="$$tmp" XDG_STATE_HOME="$$tmp/state" XDG_CONFIG_HOME="$$tmp/config" HYPRTAIL_SO="$(CURDIR)/$(OUTPUT)" \
+		HYPRTAIL_FIXTURES="$(CURDIR)/tests/hyprtester/fixtures" \
+		./build/hyprtester/hyprtester -c $(SMOKE_CONFIG) -b ./build/Hyprland -p hyprtester/plugin/hyprtestplugin.so hyprtailLifecycle; \
+	status=$$?; \
+	if [ $$status -eq 0 ]; then rm -rf "$$tmp"; echo "smoke: passed"; \
+	else echo "smoke: FAILED (exit $$status); logs kept in $$tmp" >&2; fi; \
+	exit $$status
